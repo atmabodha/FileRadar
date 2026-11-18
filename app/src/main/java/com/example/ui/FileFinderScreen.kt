@@ -59,6 +59,7 @@ import com.example.ui.components.FileControlHeader
 import com.example.ui.components.FileInspectorBottomSheet
 import com.example.ui.components.FileResultCard
 import com.example.ui.components.FullScreenImageViewerDialog
+import com.example.ui.components.FullScreenPdfChatDialog
 import com.example.ui.components.FullScreenPdfReaderDialog
 import com.example.ui.components.FullScreenVideoPlayerDialog
 import com.example.viewmodel.FileFinderViewModel
@@ -114,12 +115,14 @@ fun FileFinderScreen(
     }
 
     BackHandler(
-        enabled = uiState.activePdfReaderFile != null ||
+        enabled = uiState.activePdfChatFile != null ||
+            uiState.activePdfReaderFile != null ||
             uiState.selectedInspectorFile != null ||
             uiState.activeMediaPreviewFile != null ||
             uiState.selectedMainTab != AppMainTab.STANDARD
     ) {
         when {
+            uiState.activePdfChatFile != null -> viewModel.closePdfChat()
             uiState.activePdfReaderFile != null -> viewModel.closePdfReader()
             uiState.selectedInspectorFile != null -> viewModel.closeFileInspector()
             uiState.activeMediaPreviewFile != null -> viewModel.closeMediaPreview()
@@ -363,6 +366,7 @@ fun FileFinderScreen(
                         onFileClicked = viewModel::onFileClicked,
                         onCopyPath = copyPathToClipboard,
                         onShareFile = shareFileWithApps,
+                        onOpenPdfChat = viewModel::openPdfChat,
                         modifier = Modifier.widthIn(max = 760.dp)
                     )
                 }
@@ -431,7 +435,17 @@ fun FileFinderScreen(
                         viewModel.closePdfReader()
                         viewModel.openFileInspector(file)
                     },
-                    onDismiss = viewModel::closePdfReader
+                    onDismiss = viewModel::closePdfReader,
+                    onChatPdf = viewModel::openPdfChat
+                )
+            }
+
+            // In-App PDF Document Chat when "Chat" is clicked from the PDF File Inspector or PDF Reader
+            uiState.activePdfChatFile?.let { pdfChatFile ->
+                FullScreenPdfChatDialog(
+                    file = pdfChatFile,
+                    onOpenPdfReader = viewModel::openPdfReader,
+                    onDismiss = viewModel::closePdfChat
                 )
             }
 
@@ -442,7 +456,8 @@ fun FileFinderScreen(
                     onCopyPath = copyPathToClipboard,
                     onShareFile = shareFileWithApps,
                     onDismiss = viewModel::closeFileInspector,
-                    onOpenPdf = viewModel::openPdfReader
+                    onOpenPdf = viewModel::openPdfReader,
+                    onChatPdf = viewModel::openPdfChat
                 )
             }
         }

@@ -9,7 +9,15 @@ import androidx.test.core.app.ApplicationProvider
 import com.example.ai.OnDeviceAiEngine
 import com.example.model.FileCategory
 import com.example.model.FileFormatters
+import com.example.model.PhoneFileItem
+import com.example.model.StorageLocation
+import com.example.ui.components.PdfChatEngineOption
+import com.example.ui.components.PlaceholderGeminiSubscriptionRepository
+import com.example.ui.components.cleanAndSanitizePdfPageText
+import com.example.ui.components.generateLocalGemmaE2bPdfAnswer
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -121,5 +129,59 @@ class ExampleRobolectricTest {
         )
         assertTrue(chunks.size >= 2)
         assertEquals(64, chunks.first().embedding.size)
+    }
+
+    @Test
+    fun `pdf text data cleaning strips junk symbols and garbled runs while preserving clean content`() {
+        val noisyPdfInput = """
+            I N V O I C E
+            ~`^|\<>{}@#$%*_+=  a3${'$'}B9!k  /F12  begincmap  endstream
+            Patient Hemoglobin: 14.8 g/dL (Normal Reference: 13.2 - 16.6)
+            bcdfghjklmnpqrstvwxz ~~~ === *** \uFFFD\uE001\uF0B7
+            The total statement balance of ${'$'}1,420.50 was verifi-
+            ed on 2026-11-18.
+        """.trimIndent()
+
+        val cleaned = cleanAndSanitizePdfPageText(noisyPdfInput)
+        assertTrue(cleaned.contains("INVOICE"))
+        assertTrue(cleaned.contains("Patient Hemoglobin: 14.8 g/dL"))
+        assertTrue(cleaned.contains("verified on 2026-11-18."))
+        assertFalse(cleaned.contains("a3\$B9!k"))
+        assertFalse(cleaned.contains("begincmap"))
+        assertFalse(cleaned.contains("bcdfghjklmnpqrstvwxz"))
+    }
+
+    @Test
+    fun `pdf chat answers questions using extracted pages in both Local Gemma E2B and Gemini Subscription modes`() = runBlocking {
+        val samplePdf = PhoneFileItem(
+            id = "pdf_test_1",
+            name = "Clinical_Blood_Report_2026.pdf",
+            fullPath = "/storage/emulated/0/Documents/Clinical_Blood_Report_2026.pdf",
+            extension = "pdf",
+            mimeType = "application/pdf",
+            sizeBytes = 420_000L,
+            createdAtMillis = 1_760_000_000_000L,
+            modifiedAtMillis = 1_760_000_000_000L,
+            category = FileCategory.PDF,
+            storageLocation = StorageLocation.INTERNAL,
+            volumeLabel = "Internal Shared",
+            isSampleFile = true
+        )
+        val pages = listOf(
+            "Page 1: Hemoglobin (Hb) is 14.8 g/dL within normal reference range.",
+            "Page 2: Fasting Plasma Glucose is 89 mg/dL and HbA1c is 5.2%."
+        )
+
+        val localAnswer = generateLocalGemmaE2bPdfAnswer(samplePdf, pages, "What is the Hemoglobin value?")
+        assertEquals(PdfChatEngineOption.LOCAL_GEMMA_E2B, localAnswer.engine)
+        assertTrue(localAnswer.text.contains("14.8 g/dL"))
+        assertTrue(localAnswer.pageCitations.contains("Page 1"))
+
+        val geminiRepo = PlaceholderGeminiSubscriptionRepository()
+        val geminiAnswer = geminiRepo.generateGeminiSubscriptionAnswer(samplePdf, pages, "What is the HbA1c value?")
+        assertEquals(PdfChatEngineOption.GEMINI_SUBSCRIPTION, geminiAnswer.engine)
+        assertTrue(geminiAnswer.isSamplePlaceholder)
+        assertTrue(geminiAnswer.text.contains("5.2%"))
+        assertTrue(geminiAnswer.pageCitations.contains("Page 2"))
     }
 }

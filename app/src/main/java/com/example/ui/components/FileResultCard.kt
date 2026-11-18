@@ -18,12 +18,14 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.FilterAltOff
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.QuestionAnswer
 import androidx.compose.material.icons.filled.SearchOff
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -270,7 +272,8 @@ fun FileInspectorBottomSheet(
     onCopyPath: (String) -> Unit,
     onShareFile: (PhoneFileItem) -> Unit,
     onDismiss: () -> Unit,
-    onOpenPdf: ((PhoneFileItem) -> Unit)? = null
+    onOpenPdf: ((PhoneFileItem) -> Unit)? = null,
+    onChatPdf: ((PhoneFileItem) -> Unit)? = null
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val isPdfFile = file.category == com.example.model.FileCategory.PDF ||
@@ -321,6 +324,55 @@ fun FileInspectorBottomSheet(
 
             HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.5f))
 
+            if (isPdfFile && (onOpenPdf != null || onChatPdf != null)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    if (onOpenPdf != null) {
+                        Button(
+                            onClick = { onOpenPdf(file) },
+                            modifier = Modifier
+                                .weight(1f)
+                                .minimumInteractiveComponentSize()
+                                .testTag("inspector_open_pdf_button")
+                        ) {
+                            Icon(
+                                imageVector = categoryIcon(com.example.model.FileCategory.PDF),
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.size(8.dp))
+                            Text(
+                                text = stringResource(R.string.open_file_action),
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+
+                    if (onChatPdf != null) {
+                        FilledTonalButton(
+                            onClick = { onChatPdf(file) },
+                            modifier = Modifier
+                                .weight(1f)
+                                .minimumInteractiveComponentSize()
+                                .testTag("inspector_chat_pdf_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.QuestionAnswer,
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.size(8.dp))
+                            Text(
+                                text = stringResource(R.string.chat_pdf_action),
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+            }
+
             InspectorRow(label = "File Name", value = file.name)
             InspectorRow(label = "Full Path on Phone", value = file.fullPath, isMono = true)
             InspectorRow(
@@ -333,27 +385,6 @@ fun FileInspectorBottomSheet(
             InspectorRow(label = "Storage Location", value = "${file.storageLocation.displayName} • ${file.volumeLabel}")
             InspectorRow(label = "Creation Date", value = file.formattedCreatedDate(), isMono = true)
             InspectorRow(label = "Modification Date", value = file.formattedModifiedDate(), isMono = true)
-
-            if (isPdfFile && onOpenPdf != null) {
-                Button(
-                    onClick = { onOpenPdf(file) },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .minimumInteractiveComponentSize()
-                        .testTag("inspector_open_pdf_button")
-                ) {
-                    Icon(
-                        imageVector = categoryIcon(com.example.model.FileCategory.PDF),
-                        contentDescription = null,
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Spacer(modifier = Modifier.size(8.dp))
-                    Text(
-                        text = stringResource(R.string.open_file_action),
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-            }
 
             Row(
                 modifier = Modifier.fillMaxWidth(),

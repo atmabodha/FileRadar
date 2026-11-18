@@ -49,6 +49,7 @@ data class FileFinderUiState(
     val selectedInspectorFile: PhoneFileItem? = null,
     val activeMediaPreviewFile: PhoneFileItem? = null,
     val activePdfReaderFile: PhoneFileItem? = null,
+    val activePdfChatFile: PhoneFileItem? = null,
     val categoryCounts: Map<FileCategory, Int> = emptyMap(),
     val storageCounts: Map<StorageLocation, Int> = emptyMap(),
     val totalMatchingBytes: Long = 0L,
@@ -647,6 +648,7 @@ class FileFinderViewModel(application: Application) : AndroidViewModel(applicati
         _uiState.update {
             it.copy(
                 selectedInspectorFile = null,
+                activePdfChatFile = null,
                 activePdfReaderFile = file
             )
         }
@@ -654,6 +656,20 @@ class FileFinderViewModel(application: Application) : AndroidViewModel(applicati
 
     fun closePdfReader() {
         _uiState.update { it.copy(activePdfReaderFile = null) }
+    }
+
+    fun openPdfChat(file: PhoneFileItem) {
+        _uiState.update {
+            it.copy(
+                selectedInspectorFile = null,
+                activePdfReaderFile = null,
+                activePdfChatFile = file
+            )
+        }
+    }
+
+    fun closePdfChat() {
+        _uiState.update { it.copy(activePdfChatFile = null) }
     }
 
     private fun filterFilesByAiCategory(

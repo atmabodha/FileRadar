@@ -97,6 +97,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.charset.StandardCharsets
+import java.text.Normalizer
 import java.util.Locale
 import java.util.zip.Inflater
 import kotlin.math.roundToInt
@@ -180,7 +181,8 @@ fun FullScreenPdfReaderDialog(
     onCopyPath: (String) -> Unit,
     onShareFile: (PhoneFileItem) -> Unit,
     onOpenMetadata: (PhoneFileItem) -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    onChatPdf: ((PhoneFileItem) -> Unit)? = null
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
@@ -317,6 +319,20 @@ fun FullScreenPdfReaderDialog(
                                         style = MaterialTheme.typography.labelMedium,
                                         color = Color(0xFF67E8F9)
                                     )
+                                }
+
+                                if (onChatPdf != null) {
+                                    TextButton(
+                                        onClick = { onChatPdf(file) },
+                                        modifier = Modifier.testTag("pdf_reader_chat_button")
+                                    ) {
+                                        Text(
+                                            text = stringResource(R.string.chat_pdf_action),
+                                            style = MaterialTheme.typography.labelMedium,
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color(0xFF34D399)
+                                        )
+                                    }
                                 }
 
                                 IconButton(
@@ -931,33 +947,324 @@ private fun lookupMediaStoreUriForFile(
 }
 
 /**
- * Extracts readable text pages from a real PDF on the user's phone by decompressing PDF FlateDecode
- * content streams and parsing BT..ET text operators (Tj, TJ, ', "), or uses sample pages for sample files.
+ * Extracts readable, data-cleaned text pages from a real PDF on the user's phone by:
+ * 1. Parsing embedded `/ToUnicode` CMap tables (`beginbfchar` / `beginbfrange`) across decompressed streams,
+ * 2. Skipping non-text binary streams (`/Subtype /Image`, `/FontFile`, `/ICCBased`, `/Metadata`),
+ * 3. Extracting and translating `BT..ET` text blocks, and
+ * 4. Running the multi-stage garble/junk-symbol sanitizer (`cleanAndSanitizePdfPageText`).
  */
-private fun extractReadablePagesFromPdf(
+internal fun extractReadablePagesFromPdf(
     context: Context,
     file: PhoneFileItem,
-    expectedPageCount: Int
+    expectedPageCount: Int = 3
 ): List<String> {
     if (file.isSampleFile) {
         return buildSamplePdfPagesText(file)
     }
 
-    val rawBytes = readRealPdfBytes(context, file, maxBytes = 8 * 1024 * 1024)
+    val rawBytes = readRealPdfBytes(context, file, maxBytes = 12 * 1024 * 1024)
     if (rawBytes != null && rawBytes.size > 64) {
-        val extracted = parsePdfStreamsForText(rawBytes, expectedPageCount)
-        if (extracted.isNotEmpty()) {
-            return extracted
+        val cleanedPages = parsePdfStreamsForText(rawBytes, expectedPageCount)
+        if (cleanedPages.isNotEmpty()) {
+            return cleanedPages
         }
+
         return listOf(
             "File: ${file.name}\nPath: ${file.fullPath}\nTotal Pages: $expectedPageCount\n\n" +
-                "Note: This PDF uses scanned page images or embedded custom CID glyph tables rather than plain-text streams.\n\n" +
+                "Note: This PDF contains scanned page images or non-text vector artwork with no extractable readable text layer.\n\n" +
                 "Tap 'Page View' in the top bar to view and scroll through all $expectedPageCount rendered PDF pages directly."
         )
     }
 
     return buildSamplePdfPagesText(file)
 }
+
+/**
+ * Multi-stage PDF text data-cleaning pipeline that eliminates junk symbols, unmapped CID font
+ * artifacts, binary stream noise, Private Use Area glyph boxes, and garbled character runs while
+ * preserving clean sentences, numbers, dates, tables, and structured bullet points.
+ */
+internal fun cleanAndSanitizePdfPageText(rawText: String): String {
+    if (rawText.isBlank()) return ""
+
+    // Stage 1: Expand typographic ligatures and normalize Unicode compatibility characters
+    val ligatureExpanded = rawText
+        .replace("\uFB00", "ff")
+        .replace("\uFB01", "fi")
+        .replace("\uFB02", "fl")
+        .replace("\uFB03", "ffi")
+        .replace("\uFB04", "ffl")
+        .replace("\uFB05", "st")
+        .replace("\uFB06", "st")
+        .replace('\u00A0', ' ')
+        .replace('\u2007', ' ')
+        .replace('\u202F', ' ')
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+        .replace("\u201C", "\"")
+        .replace("\u201D", "\"")
+        .replace("\u2013", "-")
+        .replace("\u2014", " - ")
+        .replace("\u2212", "-")
+        .replace("\u2022", "• ")
+        .replace("\u25CF", "• ")
+        .replace("\u25AA", "• ")
+        .replace("\uF0B7", "• ")
+        .replace("\uF0A7", "• ")
+
+    val nfkc = try {
+        Normalizer.normalize(ligatureExpanded, Normalizer.Form.NFKC)
+    } catch (_: Throwable) {
+        ligatureExpanded
+    }
+
+    // Stage 2: Strip non-printable control chars, replacement chars (U+FFFD), and Private Use Area font icons
+    val charFiltered = StringBuilder(nfkc.length)
+    for (ch in nfkc) {
+        val code = ch.code
+        when {
+            ch == '\n' || ch == '\r' -> charFiltered.append('\n')
+            ch == '\t' -> charFiltered.append(' ')
+            // Skip ASCII & C1 control characters, soft hyphens, zero-width chars, and replacement char
+            code in 0x00..0x1F || code in 0x7F..0x9F -> continue
+            code == 0x00AD || code in 0x200B..0x200F || code == 0xFEFF || code == 0xFFFD -> continue
+            // Skip Private Use Area (U+E000..U+F8FF) and Specials/Box Drawing junk
+            code in 0xE000..0xF8FF || code in 0x2500..0x259F || code in 0xFFF0..0xFFFF -> continue
+            else -> charFiltered.append(ch)
+        }
+    }
+
+    // Stage 3: Line-by-line & token-by-token cleaning
+    val rawLines = charFiltered.toString().lines()
+    val cleanedLines = mutableListOf<String>()
+
+    for (rawLine in rawLines) {
+        val collapsedSpaces = rawLine.trim().replace(multiSpaceRegex, " ")
+        if (collapsedSpaces.isBlank()) {
+            if (cleanedLines.isNotEmpty() && cleanedLines.last().isNotEmpty()) {
+                cleanedLines.add("")
+            }
+            continue
+        }
+
+        // Repair spaced-out kerning lines like "I N V O I C E   S U M M A R Y" -> "INVOICE SUMMARY"
+        val deKernedLine = repairSpacedOutKerning(collapsedSpaces)
+
+        // Filter individual tokens to strip symbol soup, PostScript operators, and garbled CID runs
+        val cleanTokens = deKernedLine
+            .split(' ')
+            .mapNotNull { token -> sanitizePdfToken(token) }
+
+        if (cleanTokens.isEmpty()) continue
+
+        val candidateLine = cleanTokens.joinToString(" ").trim()
+        if (isCleanReadableLine(candidateLine)) {
+            cleanedLines.add(candidateLine)
+        }
+    }
+
+    // Stage 4: Rejoin hyphenated line breaks (e.g. "docu-\nment" -> "document") and collapse blank lines
+    val rejoined = StringBuilder()
+    var i = 0
+    while (i < cleanedLines.size) {
+        val current = cleanedLines[i]
+        if (current.isEmpty()) {
+            if (rejoined.isNotEmpty() && !rejoined.endsWith("\n\n")) {
+                rejoined.append("\n")
+            }
+            i++
+            continue
+        }
+
+        if (current.endsWith("-") && current.length >= 4 && i + 1 < cleanedLines.size) {
+            val nextLine = cleanedLines[i + 1]
+            val firstNextChar = nextLine.firstOrNull()
+            if (firstNextChar != null && firstNextChar.isLowerCase()) {
+                rejoined.append(current.dropLast(1)).append(nextLine).append('\n')
+                i += 2
+                continue
+            }
+        }
+
+        rejoined.append(current).append('\n')
+        i++
+    }
+
+    return rejoined.toString()
+        .replace(excessNewlinesRegex, "\n\n")
+        .trim()
+}
+
+/**
+ * Repairs lines where PDF kerning placed spaces between every single letter
+ * (e.g., "P A T I E N T   R E P O R T" -> "PATIENT REPORT").
+ */
+private fun repairSpacedOutKerning(line: String): String {
+    val tokens = line.split(' ')
+    if (tokens.size < 4) return line
+    val singleCharTokens = tokens.count { it.length == 1 && it[0].isLetterOrDigit() }
+    if (singleCharTokens.toFloat() / tokens.size.toFloat() < 0.75f) {
+        return line
+    }
+    return buildString {
+        for (token in tokens) {
+            if (token.length == 1 && token[0].isLetterOrDigit()) {
+                append(token)
+            } else {
+                if (isNotEmpty() && last() != ' ') append(' ')
+                append(token)
+                append(' ')
+            }
+        }
+    }.trim()
+}
+
+/**
+ * Cleans a single whitespace-delimited token and returns `null` if the token is garbled noise,
+ * a leaked PDF operator, or high-density symbol soup.
+ */
+private fun sanitizePdfToken(rawToken: String): String? {
+    val trimmed = rawToken.trim { ch ->
+        ch in "`~^|\\<>{}" || ch.code < 32
+    }
+    if (trimmed.isEmpty()) return null
+
+    // Allow standard bullet or list markers
+    if (trimmed == "•" || trimmed == "-" || trimmed == "–") return "•"
+
+    // Reject leaked internal PDF/PostScript syntax keywords
+    if (trimmed in pdfInternalOperatorRejectSet) return null
+    if (pdfFontOrResourceTagRegex.matches(trimmed)) return null
+
+    // Reject runs of repeated symbols (e.g. "____", "=====", "*****", "~~~~~", ".....")
+    if (repeatedSymbolRunRegex.matches(trimmed)) return null
+
+    // Reject tokens containing 2+ consecutive high-noise ASCII symbols (~ ` ^ | \ < > { } @ # $ % * _ = +)
+    if (consecutiveJunkSymbolsRegex.containsMatchIn(trimmed)) return null
+
+    val length = trimmed.length
+    var letters = 0
+    var digits = 0
+    var standardPunct = 0
+    var noisySymbols = 0
+
+    for (ch in trimmed) {
+        when {
+            ch.isLetter() -> letters++
+            ch.isDigit() -> digits++
+            ch in ".,;:!?'\"()-/$%&•+@" -> standardPunct++
+            else -> noisySymbols++
+        }
+    }
+
+    val alnum = letters + digits
+    if (alnum == 0) return null
+
+    // If token has any noisy symbol and is short, or noisy symbols exceed 15% of token, drop it
+    if (noisySymbols > 0 && (length <= 4 || noisySymbols.toFloat() / length.toFloat() > 0.15f)) {
+        return null
+    }
+
+    // For tokens of length >= 3, require at least 55% alphanumeric characters
+    if (length >= 3 && alnum.toFloat() / length.toFloat() < 0.55f) {
+        return null
+    }
+
+    // Detect garbled interleaved symbol/digit/case tokens typical of unmapped CID font bytes (e.g. "a3$B9!k" or "G#8p@2")
+    if (length >= 4 && letters > 0 && digits > 0 && (noisySymbols > 0 || standardPunct >= 2)) {
+        val isNormalDateOrCurrencyOrVersion = validStructuredAlnumPunctRegex.matches(trimmed)
+        if (!isNormalDateOrCurrencyOrVersion) {
+            return null
+        }
+    }
+
+    // Detect unpronounceable consonant/symbol gibberish in long Latin tokens
+    if (letters >= 8 && digits == 0) {
+        val vowelCount = trimmed.count { it.lowercaseChar() in "aeiouy" }
+        val nonLatinCount = trimmed.count { it.code > 127 && it.isLetter() }
+        if (vowelCount == 0 && nonLatinCount == 0) {
+            return null
+        }
+    }
+
+    // Reject excessively long unbroken non-URL strings (e.g. base64 or hex dumps)
+    if (length > 45 && !trimmed.startsWith("http", ignoreCase = true) && !trimmed.contains('/')) {
+        return null
+    }
+
+    return trimmed
+}
+
+/**
+ * Evaluates whether a reconstructed line is clean, human-readable text rather than garbled stream noise.
+ */
+private fun isCleanReadableLine(line: String): Boolean {
+    if (line.isBlank()) return false
+
+    var letters = 0
+    var digits = 0
+    var spaces = 0
+    var cleanPunct = 0
+    var otherChars = 0
+
+    for (ch in line) {
+        when {
+            ch.isLetter() -> letters++
+            ch.isDigit() -> digits++
+            ch == ' ' -> spaces++
+            ch in ".,;:!?'\"()-/$%&•+@" -> cleanPunct++
+            else -> otherChars++
+        }
+    }
+
+    val alnum = letters + digits
+    if (alnum == 0) return false
+
+    // Allow short numeric page labels or list numbers (e.g. "1", "12", "Page 2")
+    if (line.length <= 4 && digits >= 1 && otherChars == 0) return true
+
+    if (alnum < 2) return false
+
+    // Require at least 86% of the line to be letters, digits, spaces, or normal punctuation
+    val cleanRatio = (alnum + spaces + cleanPunct).toFloat() / line.length.toFloat()
+    if (cleanRatio < 0.86f) return false
+
+    // Require alphanumeric characters to outnumber punctuation/symbols by at least 2.5x
+    val totalSymbols = cleanPunct + otherChars
+    if (totalSymbols > 0 && alnum.toFloat() / totalSymbols.toFloat() < 2.2f) {
+        return false
+    }
+
+    // If the line has 5+ Latin letters, ensure it has a realistic vowel ratio (>= 14%) so shifted-ASCII consonant garble is rejected
+    val latinLetters = line.count { it in 'A'..'Z' || it in 'a'..'z' }
+    if (latinLetters >= 5) {
+        val vowels = line.count { it.lowercaseChar() in "aeiouy" }
+        val vowelRatio = vowels.toFloat() / latinLetters.toFloat()
+        if (vowelRatio < 0.14f || vowelRatio > 0.88f) {
+            return false
+        }
+    }
+
+    return true
+}
+
+private val multiSpaceRegex = Regex(" {2,}")
+private val whitespaceRegex = Regex("\\s+")
+private val excessNewlinesRegex = Regex("\n{3,}")
+private val repeatedSymbolRunRegex = Regex("^[^a-zA-Z0-9]{2,}$|([_\\-=*~.#•])\\1{2,}")
+private val consecutiveJunkSymbolsRegex = Regex("[~`^|\\\\<>{}@#$%*_+=]{2,}")
+private val pdfFontOrResourceTagRegex = Regex("^/[A-Za-z0-9_+\\-.]+$")
+private val validStructuredAlnumPunctRegex = Regex(
+    "^(\\$?[0-9]{1,3}(,[0-9]{3})*(\\.[0-9]+)?%?|v?[0-9]+(\\.[0-9]+)+|[0-9]{1,4}[/-][0-9]{1,2}[/-][0-9]{1,4}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}|[A-Za-z]+-[0-9]+|[0-9]+[A-Za-z]{1,4}|\\([0-9A-Za-z.,%-]+\\))[,.;:]?$"
+)
+
+private val pdfInternalOperatorRejectSet = setOf(
+    "BT", "ET", "Tj", "TJ", "Tf", "Td", "TD", "Tm", "T*", "Tc", "Tw", "Tz", "TL", "Ts", "Tr",
+    "cm", "re", "rg", "RG", "gs", "q", "Q", "W", "W*", "n", "f", "F", "f*", "B", "B*", "b", "b*",
+    "stream", "endstream", "obj", "endobj", "xref", "trailer", "startxref",
+    "FlateDecode", "Identity-H", "CIDInit", "ProcSet", "begincmap", "endcmap",
+    "begincodespacerange", "endcodespacerange", "beginbfchar", "endbfchar", "beginbfrange", "endbfrange"
+)
 
 private fun readRealPdfBytes(
     context: Context,
@@ -994,21 +1301,43 @@ private fun readRealPdfBytes(
     return null
 }
 
+private val bfCharEntryRegex = Regex("<([0-9A-Fa-f]+)>\\s*<([0-9A-Fa-f]+)>")
+private val bfRangeEntryRegex = Regex("<([0-9A-Fa-f]+)>\\s*<([0-9A-Fa-f]+)>\\s*<([0-9A-Fa-f]+)>")
+private val pdfTextOperatorCheckRegex = Regex("\\b(Tj|TJ|Tf)\\b")
+
 private fun parsePdfStreamsForText(
     pdfBytes: ByteArray,
     expectedPageCount: Int
 ): List<String> {
     val rawLatin = String(pdfBytes, StandardCharsets.ISO_8859_1)
-    val extractedBlocks = mutableListOf<String>()
+    val decompressedCandidateStreams = mutableListOf<String>()
+    val toUnicodeMap = mutableMapOf<Int, String>()
 
     var searchIdx = 0
-    while (searchIdx < rawLatin.length && extractedBlocks.size < 120) {
+    while (searchIdx < rawLatin.length && decompressedCandidateStreams.size < 160) {
         val streamKeywordIdx = rawLatin.indexOf("stream", searchIdx)
         if (streamKeywordIdx < 0) break
 
-        // Ensure it's not "endstream"
         if (streamKeywordIdx >= 3 && rawLatin.substring(streamKeywordIdx - 3, streamKeywordIdx) == "end") {
             searchIdx = streamKeywordIdx + 6
+            continue
+        }
+
+        // Inspect the object dictionary immediately preceding `stream`
+        val dictWindowStart = (streamKeywordIdx - 360).coerceAtLeast(0)
+        val streamDictHeader = rawLatin.substring(dictWindowStart, streamKeywordIdx)
+        if (
+            streamDictHeader.contains("/Subtype /Image") ||
+            streamDictHeader.contains("/Subtype/Image") ||
+            streamDictHeader.contains("/FontFile") ||
+            streamDictHeader.contains("/Length1") ||
+            streamDictHeader.contains("/Metadata") ||
+            streamDictHeader.contains("/ICCBased") ||
+            streamDictHeader.contains("/Type /XRef") ||
+            streamDictHeader.contains("/Type/XRef")
+        ) {
+            val skipEnd = rawLatin.indexOf("endstream", streamKeywordIdx + 6)
+            searchIdx = if (skipEnd > 0) skipEnd + 9 else streamKeywordIdx + 6
             continue
         }
 
@@ -1030,25 +1359,104 @@ private fun parsePdfStreamsForText(
             val decodedString = tryInflatePdfStream(streamBytes)
                 ?: String(streamBytes, StandardCharsets.ISO_8859_1)
 
-            if (decodedString.contains("BT") && decodedString.contains("ET")) {
-                val textFromStream = extractTextFromBtEtBlocks(decodedString)
-                if (textFromStream.length >= 12) {
-                    extractedBlocks.add(textFromStream)
-                }
+            if (decodedString.contains("begincmap") &&
+                (decodedString.contains("beginbfchar") || decodedString.contains("beginbfrange"))
+            ) {
+                parseToUnicodeCMapInto(decodedString, toUnicodeMap)
+            } else if (
+                decodedString.contains("BT") &&
+                decodedString.contains("ET") &&
+                pdfTextOperatorCheckRegex.containsMatchIn(decodedString)
+            ) {
+                decompressedCandidateStreams.add(decodedString)
             }
         }
 
         searchIdx = endStreamIdx + 9
     }
 
+    if (decompressedCandidateStreams.isEmpty()) return emptyList()
+
+    val extractedBlocks = mutableListOf<String>()
+    for (decodedStream in decompressedCandidateStreams) {
+        val rawStreamText = extractTextFromBtEtBlocks(decodedStream, toUnicodeMap)
+        val cleanedStreamText = cleanAndSanitizePdfPageText(rawStreamText)
+        if (cleanedStreamText.length >= 16) {
+            extractedBlocks.add(cleanedStreamText)
+        }
+    }
+
     if (extractedBlocks.isEmpty()) return emptyList()
 
-    // Group extracted blocks into pages matching expectedPageCount if needed
     return if (extractedBlocks.size <= expectedPageCount.coerceAtLeast(1)) {
         extractedBlocks
     } else {
         val perPage = (extractedBlocks.size.toFloat() / expectedPageCount.coerceAtLeast(1)).roundToInt().coerceAtLeast(1)
         extractedBlocks.chunked(perPage).map { it.joinToString("\n\n") }
+    }
+}
+
+private fun parseToUnicodeCMapInto(cmapStream: String, targetMap: MutableMap<Int, String>) {
+    // 1. Parse beginbfchar ... endbfchar
+    var searchCursor = 0
+    while (searchCursor < cmapStream.length && targetMap.size < 16_384) {
+        val startIdx = cmapStream.indexOf("beginbfchar", searchCursor)
+        if (startIdx < 0) break
+        val endIdx = cmapStream.indexOf("endbfchar", startIdx + 11)
+        if (endIdx < 0) break
+
+        val section = cmapStream.substring(startIdx + 11, endIdx)
+        for (match in bfCharEntryRegex.findAll(section)) {
+            val srcCode = match.groupValues[1].toIntOrNull(16) ?: continue
+            val dstUnicode = decodeHexToUnicodeString(match.groupValues[2])
+            if (dstUnicode.isNotEmpty()) {
+                targetMap[srcCode] = dstUnicode
+            }
+        }
+        searchCursor = endIdx + 9
+    }
+
+    // 2. Parse beginbfrange ... endbfrange
+    searchCursor = 0
+    while (searchCursor < cmapStream.length && targetMap.size < 16_384) {
+        val startIdx = cmapStream.indexOf("beginbfrange", searchCursor)
+        if (startIdx < 0) break
+        val endIdx = cmapStream.indexOf("endbfrange", startIdx + 12)
+        if (endIdx < 0) break
+
+        val section = cmapStream.substring(startIdx + 12, endIdx)
+        for (match in bfRangeEntryRegex.findAll(section)) {
+            val startCode = match.groupValues[1].toIntOrNull(16) ?: continue
+            val endCode = match.groupValues[2].toIntOrNull(16) ?: continue
+            val baseTarget = match.groupValues[3].toIntOrNull(16) ?: continue
+            val span = (endCode - startCode).coerceIn(0, 512)
+            for (offset in 0..span) {
+                val targetCodePoint = baseTarget + offset
+                if (targetCodePoint in 32..0xD7FF || targetCodePoint in 0xE000..0xFFFD) {
+                    targetMap[startCode + offset] = targetCodePoint.toChar().toString()
+                }
+            }
+        }
+        searchCursor = endIdx + 10
+    }
+}
+
+private fun decodeHexToUnicodeString(hex: String): String {
+    if (hex.isEmpty()) return ""
+    return try {
+        val clean = if (hex.length % 2 == 0) hex else "0$hex"
+        if (clean.length % 4 == 0) {
+            val bytes = ByteArray(clean.length / 2)
+            for (i in bytes.indices) {
+                bytes[i] = clean.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+            }
+            String(bytes, StandardCharsets.UTF_16BE)
+        } else {
+            val code = clean.toInt(16)
+            if (code in 32..126 || code >= 160) code.toChar().toString() else ""
+        }
+    } catch (_: Throwable) {
+        ""
     }
 }
 
@@ -1073,7 +1481,6 @@ private fun tryInflatePdfStream(compressed: ByteArray): String? {
                 return String(out.toByteArray(), StandardCharsets.ISO_8859_1)
             }
         } catch (_: Throwable) {
-            // Try next nowrap setting
         } finally {
             inflater.end()
         }
@@ -1081,7 +1488,10 @@ private fun tryInflatePdfStream(compressed: ByteArray): String? {
     return null
 }
 
-private fun extractTextFromBtEtBlocks(content: String): String {
+private fun extractTextFromBtEtBlocks(
+    content: String,
+    toUnicodeMap: Map<Int, String>
+): String {
     val sb = StringBuilder()
     var cursor = 0
     while (cursor < content.length) {
@@ -1095,29 +1505,30 @@ private fun extractTextFromBtEtBlocks(content: String): String {
         while (i < block.length) {
             val ch = block[i]
             if (ch == '(') {
-                // Parse PDF literal string (...) with nested parentheses & backslash escapes
                 var depth = 1
                 i++
-                val token = StringBuilder()
+                val rawCodes = mutableListOf<Int>()
+                val directChars = StringBuilder()
                 while (i < block.length && depth > 0) {
                     val c = block[i]
                     if (c == '\\' && i + 1 < block.length) {
                         val next = block[i + 1]
                         when (next) {
                             'n' -> {
-                                token.append('\n')
+                                directChars.append('\n')
                                 i += 2
                             }
                             'r' -> {
-                                token.append('\r')
+                                directChars.append('\r')
                                 i += 2
                             }
                             't' -> {
-                                token.append(' ')
+                                directChars.append(' ')
                                 i += 2
                             }
                             '(', ')', '\\' -> {
-                                token.append(next)
+                                rawCodes.add(next.code)
+                                directChars.append(next)
                                 i += 2
                             }
                             in '0'..'7' -> {
@@ -1129,41 +1540,54 @@ private fun extractTextFromBtEtBlocks(content: String): String {
                                     k++
                                 }
                                 val code = octStr.toIntOrNull(8)
-                                if (code != null && code in 32..126) {
-                                    token.append(code.toChar())
+                                if (code != null) {
+                                    rawCodes.add(code)
+                                    if (code in 32..126) directChars.append(code.toChar())
                                 }
                                 i = k
                             }
                             else -> {
-                                token.append(next)
+                                rawCodes.add(next.code)
+                                directChars.append(next)
                                 i += 2
                             }
                         }
                     } else if (c == '(') {
                         depth++
-                        token.append(c)
+                        directChars.append(c)
                         i++
                     } else if (c == ')') {
                         depth--
-                        if (depth > 0) token.append(c)
+                        if (depth > 0) directChars.append(c)
                         i++
                     } else {
+                        rawCodes.add(c.code and 0xFF)
                         if (c.code in 32..126 || c == '\n') {
-                            token.append(c)
+                            directChars.append(c)
                         }
                         i++
                     }
                 }
-                val clean = token.toString().trim()
-                if (clean.isNotEmpty()) {
-                    sb.append(clean).append(' ')
+                val directStr = directChars.toString().trim()
+                // If direct ASCII string looks garbled and a CMap mapping exists, try CMap translation
+                val resolvedToken = if (
+                    toUnicodeMap.isNotEmpty() &&
+                    rawCodes.isNotEmpty() &&
+                    directStr.count { it in "`~^|\\<>{}@#$%*_+=!" } > directStr.length / 3
+                ) {
+                    rawCodes.joinToString("") { code -> toUnicodeMap[code] ?: "" }.trim()
+                } else {
+                    directStr
+                }
+
+                if (resolvedToken.isNotEmpty()) {
+                    sb.append(resolvedToken).append(' ')
                 }
             } else if (ch == '<' && (i + 1 >= block.length || block[i + 1] != '<')) {
-                // Parse hex string <...>
                 val closeIdx = block.indexOf('>', i + 1)
                 if (closeIdx > i + 1) {
-                    val hex = block.substring(i + 1, closeIdx).replace( whitespaceRegex, "")
-                    val decodedHex = decodePdfHexString(hex)
+                    val hex = block.substring(i + 1, closeIdx).replace(whitespaceRegex, "")
+                    val decodedHex = decodePdfHexString(hex, toUnicodeMap)
                     if (decodedHex.isNotBlank()) {
                         sb.append(decodedHex).append(' ')
                     }
@@ -1183,19 +1607,54 @@ private fun extractTextFromBtEtBlocks(content: String): String {
     }
 
     return sb.toString()
-        .lines()
-        .map { it.trim().replace(multiSpaceRegex, " ") }
-        .filter { line -> line.count { it.isLetterOrDigit() } >= 2 }
-        .joinToString("\n")
 }
 
-private val whitespaceRegex = Regex("\\s+")
-private val multiSpaceRegex = Regex(" {2,}")
-
-private fun decodePdfHexString(hex: String): String {
+private fun decodePdfHexString(
+    hex: String,
+    toUnicodeMap: Map<Int, String>
+): String {
     if (hex.length < 2) return ""
     return try {
         val clean = if (hex.length % 2 == 0) hex else "${hex}0"
+
+        // 1. Try 2-byte (4 hex char) CMap lookup first (standard for Identity-H CID fonts)
+        if (toUnicodeMap.isNotEmpty() && clean.length % 4 == 0) {
+            val mapped16 = StringBuilder()
+            var hits = 0
+            val totalGlyphs = clean.length / 4
+            for (idx in 0 until totalGlyphs) {
+                val code = clean.substring(idx * 4, idx * 4 + 4).toInt(16)
+                val mapped = toUnicodeMap[code]
+                if (mapped != null) {
+                    hits++
+                    mapped16.append(mapped)
+                } else if (code in 32..126) {
+                    mapped16.append(code.toChar())
+                }
+            }
+            if (hits > 0 && hits * 2 >= totalGlyphs) {
+                return mapped16.toString()
+            }
+        }
+
+        // 2. Try 1-byte (2 hex char) CMap lookup
+        if (toUnicodeMap.isNotEmpty()) {
+            val mapped8 = StringBuilder()
+            var hits = 0
+            val totalGlyphs = clean.length / 2
+            for (idx in 0 until totalGlyphs) {
+                val code = clean.substring(idx * 2, idx * 2 + 2).toInt(16)
+                val mapped = toUnicodeMap[code]
+                if (mapped != null) {
+                    hits++
+                    mapped8.append(mapped)
+                }
+            }
+            if (hits > 0 && hits * 2 >= totalGlyphs) {
+                return mapped8.toString()
+            }
+        }
+
         val bytes = ByteArray(clean.length / 2)
         for (idx in bytes.indices) {
             bytes[idx] = clean.substring(idx * 2, idx * 2 + 2).toInt(16).toByte()

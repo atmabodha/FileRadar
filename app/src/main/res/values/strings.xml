@@ -24,5 +24,10 @@
     <string name="file_inspector_title">File Metadata Inspector</string>
     <string name="close_inspector">Close details</string>
     <string name="open_file_action">Open</string>
+    <string name="chat_pdf_action">Chat</string>
     <string name="pdf_reader_title">PDF Reader</string>
+    <string name="pdf_chat_title">PDF Document Chat</string>
+    <string name="chat_engine_local_gemma">Local Gemma E2B</string>
+    <string name="chat_engine_gemini_subscription">Gemini Subscription</string>
+    <string name="firebase_required_notice">Connected to keyless Firebase AI Logic (gemini-3.8-flash Free Tier). No GEMINI_API_KEY is used and no paid billing is required.</string>
 </resources>

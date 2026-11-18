@@ -134,6 +134,7 @@ fun AiSearchScreen(
     onFileClicked: (PhoneFileItem) -> Unit,
     onCopyPath: (String) -> Unit,
     onShareFile: (PhoneFileItem) -> Unit,
+    onOpenPdfChat: ((PhoneFileItem) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     // Graceful degradation when Master AI Kill Switch is OFF
@@ -354,7 +355,8 @@ fun AiSearchScreen(
                         allFiles = categoryFilteredRagFiles,
                         messages = ragMessages,
                         onSelectDocument = onSelectRagDocument,
-                        onSendQuestion = onSendRagQuestion
+                        onSendQuestion = onSendRagQuestion,
+                        onOpenPdfChat = onOpenPdfChat
                     )
                 }
             }
@@ -1467,7 +1469,8 @@ private fun DocumentQaRagSection(
     allFiles: List<PhoneFileItem>,
     messages: List<RagChatMessage>,
     onSelectDocument: (PhoneFileItem) -> Unit,
-    onSendQuestion: (String) -> Unit
+    onSendQuestion: (String) -> Unit,
+    onOpenPdfChat: ((PhoneFileItem) -> Unit)? = null
 ) {
     var docPickerExpanded by remember { mutableStateOf(false) }
     var questionInput by remember { mutableStateOf("") }
@@ -1487,7 +1490,7 @@ private fun DocumentQaRagSection(
     )
 
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        // Document Picker Trigger
+        // 1. Document Picker Trigger
         Box(modifier = Modifier.fillMaxWidth()) {
             Surface(
                 onClick = { docPickerExpanded = true },
@@ -1569,31 +1572,159 @@ private fun DocumentQaRagSection(
             }
         }
 
-        // Quick RAG Question Chips
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        // 2. Prominent Query Entry Card at the Top (Always Visible Without Scrolling)
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = MaterialTheme.shapes.medium,
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f)
+            ),
+            border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary)
         ) {
-            quickPrompts.forEach { prompt ->
-                Surface(
-                    onClick = { onSendQuestion(prompt) },
-                    shape = CircleShape,
-                    color = MaterialTheme.colorScheme.surfaceVariant,
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Text(
-                        text = prompt,
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Forum,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Text(
+                            text = "ENTER YOUR QUESTION ABOUT THIS DOCUMENT",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedTextField(
+                        value = questionInput,
+                        onValueChange = { questionInput = it },
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("rag_question_input"),
+                        singleLine = true,
+                        placeholder = {
+                            Text(
+                                text = "Type your question about ${currentDoc?.name ?: "this document"}…",
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        },
+                        trailingIcon = {
+                            if (questionInput.isNotEmpty()) {
+                                IconButton(onClick = { questionInput = "" }) {
+                                    Icon(
+                                        imageVector = Icons.Default.Clear,
+                                        contentDescription = "Clear question"
+                                    )
+                                }
+                            }
+                        },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedContainerColor = MaterialTheme.colorScheme.surface,
+                            unfocusedContainerColor = MaterialTheme.colorScheme.surface,
+                            focusedBorderColor = MaterialTheme.colorScheme.primary,
+                            unfocusedBorderColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.65f)
+                        )
                     )
+                    Button(
+                        onClick = {
+                            if (questionInput.isNotBlank()) {
+                                onSendQuestion(questionInput)
+                                questionInput = ""
+                            }
+                        },
+                        enabled = questionInput.isNotBlank(),
+                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+                        modifier = Modifier
+                            .height(54.dp)
+                            .testTag("rag_send_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.Send,
+                            contentDescription = "Ask document",
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Ask",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
+                // Quick RAG Question Chips
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    quickPrompts.forEach { prompt ->
+                        Surface(
+                            onClick = { onSendQuestion(prompt) },
+                            shape = CircleShape,
+                            color = MaterialTheme.colorScheme.surface,
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+                        ) {
+                            Text(
+                                text = prompt,
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                            )
+                        }
+                    }
+                }
+
+                if (currentDoc != null &&
+                    (currentDoc.category == FileCategory.PDF || currentDoc.extension.equals("pdf", ignoreCase = true)) &&
+                    onOpenPdfChat != null
+                ) {
+                    OutlinedButton(
+                        onClick = { onOpenPdfChat(currentDoc) },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .minimumInteractiveComponentSize()
+                            .testTag("rag_open_pdf_chat_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.AutoAwesome,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Open Full PDF Chat (Gemma E2B / Gemini)",
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
                 }
             }
         }
 
-        // Chat Messages List
+        // 3. Chat Messages History Card
         Card(
             modifier = Modifier.fillMaxWidth(),
             shape = MaterialTheme.shapes.medium,
@@ -1604,6 +1735,13 @@ private fun DocumentQaRagSection(
                 modifier = Modifier.padding(14.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
+                Text(
+                    text = "DOCUMENT Q&A CONVERSATION",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+
                 messages.forEach { msg ->
                     Surface(
                         shape = MaterialTheme.shapes.small,
@@ -1640,41 +1778,6 @@ private fun DocumentQaRagSection(
                                 )
                             }
                         }
-                    }
-                }
-
-                // Input Row
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    OutlinedTextField(
-                        value = questionInput,
-                        onValueChange = { questionInput = it },
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("rag_question_input"),
-                        singleLine = true,
-                        placeholder = { Text("Ask about this document locally…") }
-                    )
-                    IconButton(
-                        onClick = {
-                            if (questionInput.isNotBlank()) {
-                                onSendQuestion(questionInput)
-                                questionInput = ""
-                            }
-                        },
-                        modifier = Modifier
-                            .clip(CircleShape)
-                            .background(MaterialTheme.colorScheme.primary)
-                            .testTag("rag_send_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.Send,
-                            contentDescription = "Ask document",
-                            tint = MaterialTheme.colorScheme.onPrimary
-                        )
                     }
                 }
             }
