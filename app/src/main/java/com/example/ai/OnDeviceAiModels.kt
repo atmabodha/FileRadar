@@ -17,6 +17,19 @@ enum class AiFeatureTab(val label: String, val subtitle: String) {
     DOCUMENT_QA("Doc Q&A", "On-device RAG chat with local PDFs & documents")
 }
 
+enum class AiSortField(
+    val displayName: String,
+    val shortLabel: String,
+    val description: String
+) {
+    RELEVANCE("AI Relevance (Cosine)", "Relevance", "Order by vector cosine similarity or AI confidence score"),
+    NAME("File Name", "Name", "Alphabetical order by file name"),
+    SIZE("File Size", "Size", "Order by file size in bytes"),
+    CREATED_DATE("Creation Date", "Created", "Order by date the file was created"),
+    MODIFIED_DATE("Modification Date", "Modified", "Order by date the file was last modified"),
+    EXTENSION("File Type / Extension", "Ext", "Order by file format extension (.pdf, .jpg, etc.)")
+}
+
 enum class GemmaModelStatus(val displayTitle: String, val detailText: String) {
     NOT_DOWNLOADED(
         "Not Downloaded (Tier-1 Neural Vector Engine Active)",
@@ -49,6 +62,13 @@ data class HardwareTelemetry(
     val isBatteryNotLow: Boolean = true
 )
 
+val DEFAULT_PRESET_LENS_LABELS: List<String> = listOf(
+    "Blood Report",
+    "Bank Records",
+    "Tax & Invoices",
+    "Travel & Boarding Passes"
+)
+
 data class AiSettingsState(
     val masterAiEnabled: Boolean = true,
     val requiresBatteryNotLow: Boolean = true,
@@ -61,7 +81,8 @@ data class AiSettingsState(
     val indexedFileCount: Int = 0,
     val totalVectorChunks: Int = 0,
     val isIndexingPipelineRunning: Boolean = false,
-    val currentPipelineFile: String? = null
+    val currentPipelineFile: String? = null,
+    val presetLensLabels: List<String> = DEFAULT_PRESET_LENS_LABELS
 )
 
 data class DocumentChunk(
@@ -87,7 +108,8 @@ data class DynamicLensGroup(
     val title: String,
     val description: String,
     val files: List<PhoneFileItem>,
-    val totalBytes: Long
+    val totalBytes: Long,
+    val isUserPreset: Boolean = false
 )
 
 data class RenameSuggestion(

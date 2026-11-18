@@ -269,9 +269,12 @@ fun FileInspectorBottomSheet(
     file: PhoneFileItem,
     onCopyPath: (String) -> Unit,
     onShareFile: (PhoneFileItem) -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    onOpenPdf: ((PhoneFileItem) -> Unit)? = null
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val isPdfFile = file.category == com.example.model.FileCategory.PDF ||
+        file.extension.equals("pdf", ignoreCase = true)
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -331,6 +334,27 @@ fun FileInspectorBottomSheet(
             InspectorRow(label = "Creation Date", value = file.formattedCreatedDate(), isMono = true)
             InspectorRow(label = "Modification Date", value = file.formattedModifiedDate(), isMono = true)
 
+            if (isPdfFile && onOpenPdf != null) {
+                Button(
+                    onClick = { onOpenPdf(file) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .minimumInteractiveComponentSize()
+                        .testTag("inspector_open_pdf_button")
+                ) {
+                    Icon(
+                        imageVector = categoryIcon(com.example.model.FileCategory.PDF),
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.size(8.dp))
+                    Text(
+                        text = stringResource(R.string.open_file_action),
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
@@ -351,20 +375,38 @@ fun FileInspectorBottomSheet(
                     Text(text = stringResource(R.string.copy_path_action))
                 }
 
-                Button(
-                    onClick = { onShareFile(file) },
-                    modifier = Modifier
-                        .weight(1f)
-                        .minimumInteractiveComponentSize()
-                        .testTag("inspector_share_file_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Share,
-                        contentDescription = null,
-                        modifier = Modifier.size(17.dp)
-                    )
-                    Spacer(modifier = Modifier.size(6.dp))
-                    Text(text = stringResource(R.string.share_file_action))
+                if (isPdfFile && onOpenPdf != null) {
+                    OutlinedButton(
+                        onClick = { onShareFile(file) },
+                        modifier = Modifier
+                            .weight(1f)
+                            .minimumInteractiveComponentSize()
+                            .testTag("inspector_share_file_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Share,
+                            contentDescription = null,
+                            modifier = Modifier.size(17.dp)
+                        )
+                        Spacer(modifier = Modifier.size(6.dp))
+                        Text(text = stringResource(R.string.share_file_action))
+                    }
+                } else {
+                    Button(
+                        onClick = { onShareFile(file) },
+                        modifier = Modifier
+                            .weight(1f)
+                            .minimumInteractiveComponentSize()
+                            .testTag("inspector_share_file_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Share,
+                            contentDescription = null,
+                            modifier = Modifier.size(17.dp)
+                        )
+                        Spacer(modifier = Modifier.size(6.dp))
+                        Text(text = stringResource(R.string.share_file_action))
+                    }
                 }
             }
 

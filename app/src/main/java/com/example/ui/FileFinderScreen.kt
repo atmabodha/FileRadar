@@ -59,6 +59,7 @@ import com.example.ui.components.FileControlHeader
 import com.example.ui.components.FileInspectorBottomSheet
 import com.example.ui.components.FileResultCard
 import com.example.ui.components.FullScreenImageViewerDialog
+import com.example.ui.components.FullScreenPdfReaderDialog
 import com.example.ui.components.FullScreenVideoPlayerDialog
 import com.example.viewmodel.FileFinderViewModel
 import java.io.File
@@ -113,11 +114,13 @@ fun FileFinderScreen(
     }
 
     BackHandler(
-        enabled = uiState.selectedInspectorFile != null ||
+        enabled = uiState.activePdfReaderFile != null ||
+            uiState.selectedInspectorFile != null ||
             uiState.activeMediaPreviewFile != null ||
             uiState.selectedMainTab != AppMainTab.STANDARD
     ) {
         when {
+            uiState.activePdfReaderFile != null -> viewModel.closePdfReader()
             uiState.selectedInspectorFile != null -> viewModel.closeFileInspector()
             uiState.activeMediaPreviewFile != null -> viewModel.closeMediaPreview()
             uiState.selectedMainTab != AppMainTab.STANDARD -> viewModel.selectMainTab(AppMainTab.STANDARD)
@@ -321,6 +324,10 @@ fun FileFinderScreen(
                         aiSettings = uiState.aiSettings,
                         hardware = uiState.hardwareTelemetry,
                         selectedAiTab = uiState.selectedAiFeatureTab,
+                        selectedAiCategory = uiState.selectedAiCategory,
+                        aiCategoryCounts = uiState.aiCategoryCounts,
+                        selectedAiSortField = uiState.selectedAiSortField,
+                        aiSortOrder = uiState.aiSortOrder,
                         semanticQuery = uiState.semanticQuery,
                         semanticResults = uiState.semanticResults,
                         dynamicLenses = uiState.dynamicLenses,
@@ -333,6 +340,9 @@ fun FileFinderScreen(
                         allFiles = uiState.allFiles,
                         ragMessages = uiState.ragMessages,
                         onSelectAiTab = viewModel::selectAiFeatureTab,
+                        onSelectAiCategory = viewModel::selectAiCategory,
+                        onSelectAiSortField = viewModel::selectAiSortField,
+                        onToggleAiSortOrder = viewModel::toggleAiSortOrder,
                         onUpdateSemanticQuery = viewModel::updateSemanticQuery,
                         onApplyRename = viewModel::toggleApplyRename,
                         onToggleJunkReview = viewModel::toggleJunkReview,
@@ -353,6 +363,9 @@ fun FileFinderScreen(
                         aiSettings = uiState.aiSettings,
                         hardware = uiState.hardwareTelemetry,
                         onToggleMasterAi = viewModel::setMasterAiEnabled,
+                        onAddPresetLensLabel = viewModel::addPresetLensLabel,
+                        onRemovePresetLensLabel = viewModel::removePresetLensLabel,
+                        onResetPresetLensLabels = viewModel::resetPresetLensLabels,
                         onToggleBatteryNotLow = viewModel::setRequiresBatteryNotLow,
                         onToggleRequiresCharging = viewModel::setRequiresChargingForBacklog,
                         onUpdateThermalDelay = viewModel::setThermalPacingDelayMs,
@@ -399,13 +412,28 @@ fun FileFinderScreen(
                 }
             }
 
+            // In-App PDF Reader when "Open" is clicked from the PDF File Inspector
+            uiState.activePdfReaderFile?.let { pdfFile ->
+                FullScreenPdfReaderDialog(
+                    file = pdfFile,
+                    onCopyPath = copyPathToClipboard,
+                    onShareFile = shareFileWithApps,
+                    onOpenMetadata = { file ->
+                        viewModel.closePdfReader()
+                        viewModel.openFileInspector(file)
+                    },
+                    onDismiss = viewModel::closePdfReader
+                )
+            }
+
             // File Metadata Inspector Bottom Sheet
             uiState.selectedInspectorFile?.let { inspectedFile ->
                 FileInspectorBottomSheet(
                     file = inspectedFile,
                     onCopyPath = copyPathToClipboard,
                     onShareFile = shareFileWithApps,
-                    onDismiss = viewModel::closeFileInspector
+                    onDismiss = viewModel::closeFileInspector,
+                    onOpenPdf = viewModel::openPdfReader
                 )
             }
         }

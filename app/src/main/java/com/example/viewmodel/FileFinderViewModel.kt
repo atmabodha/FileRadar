@@ -1,12 +1,15 @@
 package com.example.viewmodel
 
 import android.app.Application
+import android.content.Context
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.ai.AiFeatureTab
 import com.example.ai.AiSettingsState
+import com.example.ai.AiSortField
 import com.example.ai.AppMainTab
+import com.example.ai.DEFAULT_PRESET_LENS_LABELS
 import com.example.ai.DynamicLensGroup
 import com.example.ai.GemmaModelStatus
 import com.example.ai.HardwareTelemetry
@@ -31,6 +34,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.yield
 
 data class FileFinderUiState(
     val selectedMainTab: AppMainTab = AppMainTab.STANDARD,
@@ -44,6 +48,7 @@ data class FileFinderUiState(
     val isScanning: Boolean = true,
     val selectedInspectorFile: PhoneFileItem? = null,
     val activeMediaPreviewFile: PhoneFileItem? = null,
+    val activePdfReaderFile: PhoneFileItem? = null,
     val categoryCounts: Map<FileCategory, Int> = emptyMap(),
     val storageCounts: Map<StorageLocation, Int> = emptyMap(),
     val totalMatchingBytes: Long = 0L,
@@ -54,6 +59,10 @@ data class FileFinderUiState(
     val aiSettings: AiSettingsState = AiSettingsState(),
     val hardwareTelemetry: HardwareTelemetry = HardwareTelemetry(),
     val selectedAiFeatureTab: AiFeatureTab = AiFeatureTab.SEMANTIC_SEARCH,
+    val selectedAiCategory: FileCategory = FileCategory.ALL,
+    val aiCategoryCounts: Map<FileCategory, Int> = emptyMap(),
+    val selectedAiSortField: AiSortField = AiSortField.RELEVANCE,
+    val aiSortOrder: SortOrder = SortOrder.DESCENDING,
     val semanticQuery: String = "",
     val semanticResults: List<SemanticSearchResult> = emptyList(),
     val dynamicLenses: List<DynamicLensGroup> = emptyList(),
@@ -78,7 +87,9 @@ class FileFinderViewModel(application: Application) : AndroidViewModel(applicati
 
     private val repository = PhoneFileScannerRepository(application.applicationContext)
     private val aiEngine = OnDeviceAiEngine(application.applicationContext)
+    private val prefs = application.applicationContext.getSharedPreferences("file_radar_ai_prefs", Context.MODE_PRIVATE)
     private val sessionTreeUris = mutableListOf<Uri>()
+    private var scanJob: Job? = null
     private var indexingJob: Job? = null
 
     private val _uiState = MutableStateFlow(FileFinderUiState())
@@ -88,12 +99,19 @@ class FileFinderViewModel(application: Application) : AndroidViewModel(applicati
         val fullAccess = repository.hasAllFilesAccess()
         val persisted = repository.getPersistedFolderUris()
         val hw = aiEngine.readHardwareTelemetry()
+        val savedPresetsRaw = prefs.getString("preset_lens_labels", null)
+        val initialPresets = if (savedPresetsRaw != null) {
+            savedPresetsRaw.split("||").map { it.trim() }.filter { it.isNotEmpty() }
+        } else {
+            DEFAULT_PRESET_LENS_LABELS
+        }
         _uiState.update {
             it.copy(
                 hasAllFilesAccess = fullAccess,
                 authorizedFolderCount = persisted.size,
                 includeSampleIndex = !fullAccess && persisted.isEmpty(),
-                hardwareTelemetry = hw
+                hardwareTelemetry = hw,
+                aiSettings = it.aiSettings.copy(presetLensLabels = initialPresets)
             )
         }
         rescanStorage()
@@ -143,7 +161,8 @@ class FileFinderViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun rescanStorage() {
-        viewModelScope.launch {
+        scanJob?.cancel()
+        scanJob = viewModelScope.launch(Dispatchers.Default) {
             val fullAccess = repository.hasAllFilesAccess()
             val hw = aiEngine.readHardwareTelemetry()
             _uiState.update {
@@ -159,17 +178,22 @@ class FileFinderViewModel(application: Application) : AndroidViewModel(applicati
                 additionalTreeUris = persisted,
                 includeSampleIndex = currentIncludeSample
             )
-            _uiState.update { current ->
-                val updated = recomputeState(
-                    current.copy(
-                        allFiles = scanned,
-                        hasAllFilesAccess = fullAccess,
-                        authorizedFolderCount = persisted.size,
-                        isScanning = false
-                    )
+
+            // 1. Immediately compute and publish Standard screen state off the Main Thread so the UI renders right away
+            val standardUpdated = recomputeState(
+                _uiState.value.copy(
+                    allFiles = scanned,
+                    hasAllFilesAccess = fullAccess,
+                    authorizedFolderCount = persisted.size,
+                    isScanning = false
                 )
-                recomputeAiOutputs(updated)
-            }
+            )
+            _uiState.value = standardUpdated
+
+            // 2. Compute AI Search & Dynamic Lenses state on Default background dispatcher
+            val aiUpdated = recomputeAiOutputs(_uiState.value)
+            _uiState.value = aiUpdated
+
             if (_uiState.value.aiSettings.masterAiEnabled) {
                 startBackgroundAiIndexing(paced = false)
             }
@@ -182,7 +206,19 @@ class FileFinderViewModel(application: Application) : AndroidViewModel(applicati
         if (!stateSnap.aiSettings.masterAiEnabled) return
 
         indexingJob = viewModelScope.launch(Dispatchers.Default) {
-            val files = _uiState.value.allFiles
+            val allFiles = _uiState.value.allFiles
+            // Prioritize PDFs, Documents, and Images, capped at 60 files so background indexing finishes rapidly
+            val filesToIndex = allFiles
+                .sortedBy { file ->
+                    when (file.category) {
+                        FileCategory.PDF -> 0
+                        FileCategory.DOCUMENT, FileCategory.CODE_DATA -> 1
+                        FileCategory.IMAGE -> 2
+                        else -> 3
+                    }
+                }
+                .take(60)
+
             val chunkSize = _uiState.value.aiSettings.chunkSizeTokens
             val overlap = _uiState.value.aiSettings.chunkOverlapTokens
             val delayMs = _uiState.value.aiSettings.thermalPacingDelayMs
@@ -191,14 +227,15 @@ class FileFinderViewModel(application: Application) : AndroidViewModel(applicati
                 it.copy(
                     aiSettings = it.aiSettings.copy(
                         isIndexingPipelineRunning = true,
-                        currentPipelineFile = files.firstOrNull()?.name
+                        currentPipelineFile = filesToIndex.firstOrNull()?.name
                     )
                 )
             }
 
-            for ((index, file) in files.withIndex()) {
+            for ((index, file) in filesToIndex.withIndex()) {
                 if (!_uiState.value.aiSettings.masterAiEnabled) break
                 aiEngine.indexSingleFile(file, chunkSize, overlap)
+                yield()
                 if (paced && index < 6) {
                     _uiState.update {
                         it.copy(
@@ -214,16 +251,16 @@ class FileFinderViewModel(application: Application) : AndroidViewModel(applicati
             }
 
             // Flush model from RAM upon queue completion per Section 5 of Architecture Plan
-            _uiState.update { current ->
-                val updatedSettings = current.aiSettings.copy(
-                    indexedFileCount = aiEngine.getIndexedFileCount(),
-                    totalVectorChunks = aiEngine.getTotalIndexedChunks(),
-                    isIndexingPipelineRunning = false,
-                    currentPipelineFile = null,
-                    gemmaModelStatus = GemmaModelStatus.FLUSHED_IDLE
-                )
-                recomputeAiOutputs(current.copy(aiSettings = updatedSettings))
-            }
+            val currentSnap = _uiState.value
+            val updatedSettings = currentSnap.aiSettings.copy(
+                indexedFileCount = aiEngine.getIndexedFileCount(),
+                totalVectorChunks = aiEngine.getTotalIndexedChunks(),
+                isIndexingPipelineRunning = false,
+                currentPipelineFile = null,
+                gemmaModelStatus = GemmaModelStatus.FLUSHED_IDLE
+            )
+            val finalState = recomputeAiOutputs(currentSnap.copy(aiSettings = updatedSettings))
+            _uiState.value = finalState
         }
     }
 
@@ -303,14 +340,109 @@ class FileFinderViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    fun addPresetLensLabel(rawLabel: String) {
+        val clean = rawLabel.trim()
+        if (clean.isEmpty()) return
+        _uiState.update { current ->
+            val existing = current.aiSettings.presetLensLabels
+            if (existing.any { it.equals(clean, ignoreCase = true) }) {
+                return@update current
+            }
+            val updatedList = existing + clean
+            savePresetLensLabels(updatedList)
+            recomputeAiOutputs(
+                current.copy(
+                    aiSettings = current.aiSettings.copy(presetLensLabels = updatedList)
+                )
+            )
+        }
+    }
+
+    fun removePresetLensLabel(label: String) {
+        _uiState.update { current ->
+            val updatedList = current.aiSettings.presetLensLabels.filterNot {
+                it.equals(label, ignoreCase = true)
+            }
+            savePresetLensLabels(updatedList)
+            recomputeAiOutputs(
+                current.copy(
+                    aiSettings = current.aiSettings.copy(presetLensLabels = updatedList)
+                )
+            )
+        }
+    }
+
+    fun resetPresetLensLabels() {
+        _uiState.update { current ->
+            val defaults = DEFAULT_PRESET_LENS_LABELS
+            savePresetLensLabels(defaults)
+            recomputeAiOutputs(
+                current.copy(
+                    aiSettings = current.aiSettings.copy(presetLensLabels = defaults)
+                )
+            )
+        }
+    }
+
+    private fun savePresetLensLabels(labels: List<String>) {
+        prefs.edit().putString("preset_lens_labels", labels.joinToString("||")).apply()
+    }
+
     // ================= AI FEATURE INTERACTIONS =================
+
+    fun selectAiCategory(category: FileCategory) {
+        _uiState.update { current ->
+            recomputeAiOutputs(current.copy(selectedAiCategory = category))
+        }
+    }
+
+    fun selectAiSortField(field: AiSortField) {
+        _uiState.update { current ->
+            val nextOrder = if (current.selectedAiSortField == field) {
+                current.aiSortOrder.toggle()
+            } else {
+                when (field) {
+                    AiSortField.NAME, AiSortField.EXTENSION -> SortOrder.ASCENDING
+                    AiSortField.RELEVANCE,
+                    AiSortField.SIZE,
+                    AiSortField.CREATED_DATE,
+                    AiSortField.MODIFIED_DATE -> SortOrder.DESCENDING
+                }
+            }
+            recomputeAiOutputs(
+                current.copy(
+                    selectedAiSortField = field,
+                    aiSortOrder = nextOrder
+                )
+            )
+        }
+    }
+
+    fun toggleAiSortOrder() {
+        _uiState.update { current ->
+            recomputeAiOutputs(
+                current.copy(aiSortOrder = current.aiSortOrder.toggle())
+            )
+        }
+    }
 
     fun updateSemanticQuery(query: String) {
         _uiState.update { current ->
-            val results = aiEngine.performSemanticSearch(query, current.allFiles)
+            val filteredFiles = filterFilesByAiCategory(current.allFiles, current.selectedAiCategory)
+            val rawResults = aiEngine.performSemanticSearch(
+                query = query,
+                files = filteredFiles,
+                presetLabels = current.aiSettings.presetLensLabels
+            )
+            val sortedResults = sortSemanticResults(
+                results = rawResults,
+                appliedRenames = current.appliedRenames,
+                sortField = current.selectedAiSortField,
+                sortOrder = current.aiSortOrder
+            )
             current.copy(
                 semanticQuery = query,
-                semanticResults = results
+                semanticResults = sortedResults
             )
         }
     }
@@ -323,10 +455,22 @@ class FileFinderViewModel(application: Application) : AndroidViewModel(applicati
             } else {
                 nextMap[suggestion.file.id] = suggestion.suggestedName
             }
-            val updatedSuggestions = aiEngine.generateRenameSuggestions(current.allFiles, nextMap)
+            val filteredFiles = filterFilesByAiCategory(current.allFiles, current.selectedAiCategory)
+            val updatedSuggestions = sortRenameSuggestions(
+                suggestions = aiEngine.generateRenameSuggestions(filteredFiles, nextMap),
+                sortField = current.selectedAiSortField,
+                sortOrder = current.aiSortOrder
+            )
+            val sortedSemantic = sortSemanticResults(
+                results = current.semanticResults,
+                appliedRenames = nextMap,
+                sortField = current.selectedAiSortField,
+                sortOrder = current.aiSortOrder
+            )
             current.copy(
                 appliedRenames = nextMap,
-                renameSuggestions = updatedSuggestions
+                renameSuggestions = updatedSuggestions,
+                semanticResults = sortedSemantic
             )
         }
     }
@@ -337,7 +481,12 @@ class FileFinderViewModel(application: Application) : AndroidViewModel(applicati
             if (!nextSet.add(fileId)) {
                 nextSet.remove(fileId)
             }
-            val updatedJunk = aiEngine.analyzeJunkCandidates(current.allFiles, nextSet)
+            val filteredFiles = filterFilesByAiCategory(current.allFiles, current.selectedAiCategory)
+            val updatedJunk = sortJunkCandidates(
+                candidates = aiEngine.analyzeJunkCandidates(filteredFiles, nextSet),
+                sortField = current.selectedAiSortField,
+                sortOrder = current.aiSortOrder
+            )
             current.copy(
                 markedJunkIds = nextSet,
                 junkCandidates = updatedJunk
@@ -347,22 +496,38 @@ class FileFinderViewModel(application: Application) : AndroidViewModel(applicati
 
     fun updateNlCommandInput(command: String) {
         _uiState.update { current ->
-            val plan = aiEngine.parseNaturalLanguageCommand(command, current.allFiles, isExecuted = false)
+            val filteredFiles = filterFilesByAiCategory(current.allFiles, current.selectedAiCategory)
+            val rawPlan = aiEngine.parseNaturalLanguageCommand(command, filteredFiles, isExecuted = false)
+            val sortedPlan = rawPlan.copy(
+                matchedFiles = sortPhoneFileItems(
+                    files = rawPlan.matchedFiles,
+                    sortField = current.selectedAiSortField,
+                    sortOrder = current.aiSortOrder
+                )
+            )
             current.copy(
                 nlCommandInput = command,
-                nlCommandPlan = plan
+                nlCommandPlan = sortedPlan
             )
         }
     }
 
     fun executeNlCommandPlan() {
         _uiState.update { current ->
+            val filteredFiles = filterFilesByAiCategory(current.allFiles, current.selectedAiCategory)
             val executedPlan = aiEngine.parseNaturalLanguageCommand(
                 current.nlCommandInput,
-                current.allFiles,
+                filteredFiles,
                 isExecuted = true
             )
-            current.copy(nlCommandPlan = executedPlan)
+            val sortedPlan = executedPlan.copy(
+                matchedFiles = sortPhoneFileItems(
+                    files = executedPlan.matchedFiles,
+                    sortField = current.selectedAiSortField,
+                    sortOrder = current.aiSortOrder
+                )
+            )
+            current.copy(nlCommandPlan = sortedPlan)
         }
     }
 
@@ -478,14 +643,208 @@ class FileFinderViewModel(application: Application) : AndroidViewModel(applicati
         _uiState.update { it.copy(selectedInspectorFile = null) }
     }
 
+    fun openPdfReader(file: PhoneFileItem) {
+        _uiState.update {
+            it.copy(
+                selectedInspectorFile = null,
+                activePdfReaderFile = file
+            )
+        }
+    }
+
+    fun closePdfReader() {
+        _uiState.update { it.copy(activePdfReaderFile = null) }
+    }
+
+    private fun filterFilesByAiCategory(
+        files: List<PhoneFileItem>,
+        category: FileCategory
+    ): List<PhoneFileItem> {
+        return if (category == FileCategory.ALL) {
+            files
+        } else {
+            files.filter { it.category == category }
+        }
+    }
+
+    private fun sortPhoneFileItems(
+        files: List<PhoneFileItem>,
+        sortField: AiSortField,
+        sortOrder: SortOrder
+    ): List<PhoneFileItem> {
+        val comparator: Comparator<PhoneFileItem> = when (sortField) {
+            AiSortField.RELEVANCE, AiSortField.MODIFIED_DATE ->
+                compareBy<PhoneFileItem> { it.modifiedAtMillis }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { it.name }
+            AiSortField.NAME ->
+                compareBy<PhoneFileItem, String>(String.CASE_INSENSITIVE_ORDER) { it.name }
+            AiSortField.SIZE ->
+                compareBy<PhoneFileItem> { it.sizeBytes }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { it.name }
+            AiSortField.CREATED_DATE ->
+                compareBy<PhoneFileItem> { it.createdAtMillis }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { it.name }
+            AiSortField.EXTENSION ->
+                compareBy<PhoneFileItem, String>(String.CASE_INSENSITIVE_ORDER) { it.extension }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { it.name }
+        }
+        return if (sortOrder == SortOrder.ASCENDING) {
+            files.sortedWith(comparator)
+        } else {
+            files.sortedWith(comparator.reversed())
+        }
+    }
+
+    private fun sortSemanticResults(
+        results: List<SemanticSearchResult>,
+        appliedRenames: Map<String, String>,
+        sortField: AiSortField,
+        sortOrder: SortOrder
+    ): List<SemanticSearchResult> {
+        val comparator: Comparator<SemanticSearchResult> = when (sortField) {
+            AiSortField.RELEVANCE ->
+                compareBy<SemanticSearchResult> { it.cosineSimilarity }
+                    .thenBy { it.file.modifiedAtMillis }
+            AiSortField.NAME ->
+                compareBy<SemanticSearchResult, String>(String.CASE_INSENSITIVE_ORDER) {
+                    appliedRenames[it.file.id] ?: it.file.name
+                }
+            AiSortField.SIZE ->
+                compareBy<SemanticSearchResult> { it.file.sizeBytes }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { it.file.name }
+            AiSortField.CREATED_DATE ->
+                compareBy<SemanticSearchResult> { it.file.createdAtMillis }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { it.file.name }
+            AiSortField.MODIFIED_DATE ->
+                compareBy<SemanticSearchResult> { it.file.modifiedAtMillis }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { it.file.name }
+            AiSortField.EXTENSION ->
+                compareBy<SemanticSearchResult, String>(String.CASE_INSENSITIVE_ORDER) { it.file.extension }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { it.file.name }
+        }
+        return if (sortOrder == SortOrder.ASCENDING) {
+            results.sortedWith(comparator)
+        } else {
+            results.sortedWith(comparator.reversed())
+        }
+    }
+
+    private fun sortRenameSuggestions(
+        suggestions: List<RenameSuggestion>,
+        sortField: AiSortField,
+        sortOrder: SortOrder
+    ): List<RenameSuggestion> {
+        val comparator: Comparator<RenameSuggestion> = when (sortField) {
+            AiSortField.RELEVANCE ->
+                compareBy<RenameSuggestion> { it.confidencePercent }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { it.suggestedName }
+            AiSortField.NAME ->
+                compareBy<RenameSuggestion, String>(String.CASE_INSENSITIVE_ORDER) { it.suggestedName }
+            AiSortField.SIZE ->
+                compareBy<RenameSuggestion> { it.file.sizeBytes }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { it.originalName }
+            AiSortField.CREATED_DATE ->
+                compareBy<RenameSuggestion> { it.file.createdAtMillis }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { it.originalName }
+            AiSortField.MODIFIED_DATE ->
+                compareBy<RenameSuggestion> { it.file.modifiedAtMillis }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { it.originalName }
+            AiSortField.EXTENSION ->
+                compareBy<RenameSuggestion, String>(String.CASE_INSENSITIVE_ORDER) { it.file.extension }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { it.originalName }
+        }
+        return if (sortOrder == SortOrder.ASCENDING) {
+            suggestions.sortedWith(comparator)
+        } else {
+            suggestions.sortedWith(comparator.reversed())
+        }
+    }
+
+    private fun sortJunkCandidates(
+        candidates: List<JunkCandidate>,
+        sortField: AiSortField,
+        sortOrder: SortOrder
+    ): List<JunkCandidate> {
+        val comparator: Comparator<JunkCandidate> = when (sortField) {
+            AiSortField.RELEVANCE ->
+                compareBy<JunkCandidate> { 100 - it.sharpnessVariance }
+                    .thenBy { it.file.sizeBytes }
+            AiSortField.NAME ->
+                compareBy<JunkCandidate, String>(String.CASE_INSENSITIVE_ORDER) { it.file.name }
+            AiSortField.SIZE ->
+                compareBy<JunkCandidate> { it.file.sizeBytes }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { it.file.name }
+            AiSortField.CREATED_DATE ->
+                compareBy<JunkCandidate> { it.file.createdAtMillis }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { it.file.name }
+            AiSortField.MODIFIED_DATE ->
+                compareBy<JunkCandidate> { it.file.modifiedAtMillis }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { it.file.name }
+            AiSortField.EXTENSION ->
+                compareBy<JunkCandidate, String>(String.CASE_INSENSITIVE_ORDER) { it.file.extension }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { it.file.name }
+        }
+        return if (sortOrder == SortOrder.ASCENDING) {
+            candidates.sortedWith(comparator)
+        } else {
+            candidates.sortedWith(comparator.reversed())
+        }
+    }
+
     private fun recomputeAiOutputs(state: FileFinderUiState): FileFinderUiState {
-        val files = state.allFiles
-        val semResults = aiEngine.performSemanticSearch(state.semanticQuery, files)
-        val lenses = aiEngine.buildDynamicLenses(files)
-        val renames = aiEngine.generateRenameSuggestions(files, state.appliedRenames)
-        val junk = aiEngine.analyzeJunkCandidates(files, state.markedJunkIds)
-        val nlPlan = aiEngine.parseNaturalLanguageCommand(state.nlCommandInput, files, state.nlCommandPlan.isExecuted)
-        val defaultRagDoc = state.selectedRagFile ?: files.firstOrNull { it.category == FileCategory.PDF } ?: files.firstOrNull()
+        val allFiles = state.allFiles
+        val aiCategoryCounts = FileCategory.entries.associateWith { cat ->
+            if (cat == FileCategory.ALL) {
+                allFiles.size
+            } else {
+                allFiles.count { it.category == cat }
+            }
+        }
+        val filteredFiles = filterFilesByAiCategory(allFiles, state.selectedAiCategory)
+        val sortField = state.selectedAiSortField
+        val sortOrder = state.aiSortOrder
+
+        val semResults = sortSemanticResults(
+            results = aiEngine.performSemanticSearch(
+                query = state.semanticQuery,
+                files = filteredFiles,
+                presetLabels = state.aiSettings.presetLensLabels
+            ),
+            appliedRenames = state.appliedRenames,
+            sortField = sortField,
+            sortOrder = sortOrder
+        )
+
+        val lenses = aiEngine.buildDynamicLenses(
+            files = filteredFiles,
+            presetLabels = state.aiSettings.presetLensLabels
+        ).map { group ->
+            group.copy(
+                files = sortPhoneFileItems(group.files, sortField, sortOrder)
+            )
+        }
+
+        val renames = sortRenameSuggestions(
+            suggestions = aiEngine.generateRenameSuggestions(filteredFiles, state.appliedRenames),
+            sortField = sortField,
+            sortOrder = sortOrder
+        )
+
+        val junk = sortJunkCandidates(
+            candidates = aiEngine.analyzeJunkCandidates(filteredFiles, state.markedJunkIds),
+            sortField = sortField,
+            sortOrder = sortOrder
+        )
+
+        val rawNlPlan = aiEngine.parseNaturalLanguageCommand(state.nlCommandInput, filteredFiles, state.nlCommandPlan.isExecuted)
+        val nlPlan = rawNlPlan.copy(
+            matchedFiles = sortPhoneFileItems(rawNlPlan.matchedFiles, sortField, sortOrder)
+        )
+
+        val defaultRagDoc = state.selectedRagFile?.takeIf {
+            state.selectedAiCategory == FileCategory.ALL || it.category == state.selectedAiCategory
+        } ?: filteredFiles.firstOrNull { it.category == FileCategory.PDF } ?: filteredFiles.firstOrNull()
+
         val initialRagMessages = state.ragMessages.ifEmpty {
             if (defaultRagDoc != null) {
                 listOf(
@@ -500,6 +859,7 @@ class FileFinderViewModel(application: Application) : AndroidViewModel(applicati
         }
 
         return state.copy(
+            aiCategoryCounts = aiCategoryCounts,
             semanticResults = semResults,
             dynamicLenses = lenses,
             renameSuggestions = renames,

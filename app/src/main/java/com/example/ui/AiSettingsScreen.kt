@@ -1,8 +1,12 @@
 package com.example.ui
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -13,17 +17,21 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.BatteryChargingFull
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CleaningServices
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.DeveloperBoard
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Verified
+import androidx.compose.material.icons.filled.ViewCarousel
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -33,12 +41,18 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
@@ -48,11 +62,15 @@ import com.example.ai.AiSettingsState
 import com.example.ai.GemmaModelStatus
 import com.example.ai.HardwareTelemetry
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun AiSettingsScreen(
     aiSettings: AiSettingsState,
     hardware: HardwareTelemetry,
     onToggleMasterAi: (Boolean) -> Unit,
+    onAddPresetLensLabel: (String) -> Unit,
+    onRemovePresetLensLabel: (String) -> Unit,
+    onResetPresetLensLabels: () -> Unit,
     onToggleBatteryNotLow: (Boolean) -> Unit,
     onToggleRequiresCharging: (Boolean) -> Unit,
     onUpdateThermalDelay: (Long) -> Unit,
@@ -62,6 +80,16 @@ fun AiSettingsScreen(
     onFlushModelRam: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    var customLensInput by remember { mutableStateOf("") }
+    val suggestedPresetPool = listOf(
+        "Blood Report",
+        "Bank Records",
+        "Tax & Invoices",
+        "Travel & Boarding Passes",
+        "Property & Lease",
+        "Engineering & Books"
+    )
+
     LazyColumn(
         modifier = modifier
             .fillMaxSize()
@@ -154,6 +182,184 @@ fun AiSettingsScreen(
                         onCheckedChange = onToggleMasterAi,
                         modifier = Modifier.testTag("master_ai_kill_switch")
                     )
+                }
+            }
+        }
+
+        // 2. Pre-Set Dynamic Lens Groups Card ("Blood Report", "Bank Records", etc. + Auto-Grouping)
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = MaterialTheme.shapes.medium,
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.6f))
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.ViewCarousel,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Text(
+                                text = "Pre-Set Dynamic Lens Groups",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+
+                        TextButton(
+                            onClick = onResetPresetLensLabels,
+                            modifier = Modifier.testTag("reset_preset_lenses_button")
+                        ) {
+                            Text("Reset Defaults")
+                        }
+                    }
+
+                    Text(
+                        text = "Pre-set custom group names (e.g., \"Blood Report\", \"Bank Records\") for the AI Search Lenses tab. Files matching these labels are grouped first; any remaining files that do not fit into your pre-set labels are grouped and named automatically by AI.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    // Add new Pre-Set Label input row
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = customLensInput,
+                            onValueChange = { customLensInput = it },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("preset_lens_input"),
+                            singleLine = true,
+                            placeholder = {
+                                Text("e.g. Blood Report, Bank Records, Salary Slips…")
+                            }
+                        )
+
+                        Button(
+                            onClick = {
+                                if (customLensInput.isNotBlank()) {
+                                    onAddPresetLensLabel(customLensInput)
+                                    customLensInput = ""
+                                }
+                            },
+                            enabled = aiSettings.masterAiEnabled,
+                            modifier = Modifier
+                                .minimumInteractiveComponentSize()
+                                .testTag("add_preset_lens_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Add,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Add")
+                        }
+                    }
+
+                    // Active Pre-Set Labels
+                    Text(
+                        text = "Active Pre-Set Labels (${aiSettings.presetLensLabels.size}) — Tap × to remove:",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+
+                    if (aiSettings.presetLensLabels.isEmpty()) {
+                        Text(
+                            text = "No pre-set labels active — all files will be grouped and named 100% automatically by AI.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else {
+                        FlowRow(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            aiSettings.presetLensLabels.forEach { label ->
+                                Surface(
+                                    onClick = { onRemovePresetLensLabel(label) },
+                                    modifier = Modifier.testTag("preset_lens_chip_$label"),
+                                    shape = CircleShape,
+                                    color = MaterialTheme.colorScheme.primaryContainer,
+                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary)
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Text(
+                                            text = label,
+                                            style = MaterialTheme.typography.labelLarge,
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
+                                        Icon(
+                                            imageVector = Icons.Default.Close,
+                                            contentDescription = "Remove $label",
+                                            tint = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.size(14.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Quick-Add Suggestions for any missing common presets
+                    val missingSuggestions = suggestedPresetPool.filter { candidate ->
+                        aiSettings.presetLensLabels.none { it.equals(candidate, ignoreCase = true) }
+                    }
+                    if (missingSuggestions.isNotEmpty()) {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text(
+                                text = "Quick-add common pre-sets:",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                missingSuggestions.forEach { suggestion ->
+                                    Surface(
+                                        onClick = { onAddPresetLensLabel(suggestion) },
+                                        shape = CircleShape,
+                                        color = MaterialTheme.colorScheme.surfaceVariant,
+                                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+                                    ) {
+                                        Text(
+                                            text = "+ $suggestion",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = MaterialTheme.colorScheme.onSurface,
+                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -22,6 +22,10 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.automirrored.filled.Sort
+import androidx.compose.material.icons.filled.ArrowDownward
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.Check
@@ -69,6 +73,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.ai.AiFeatureTab
 import com.example.ai.AiSettingsState
+import com.example.ai.AiSortField
 import com.example.ai.DynamicLensGroup
 import com.example.ai.HardwareTelemetry
 import com.example.ai.JunkCandidate
@@ -79,6 +84,7 @@ import com.example.ai.SemanticSearchResult
 import com.example.model.FileCategory
 import com.example.model.FileFormatters
 import com.example.model.PhoneFileItem
+import com.example.model.SortOrder
 import com.example.ui.components.MediaThumbnailBox
 import com.example.ui.components.categoryIcon
 import java.util.Locale
@@ -98,6 +104,10 @@ fun AiSearchScreen(
     aiSettings: AiSettingsState,
     hardware: HardwareTelemetry,
     selectedAiTab: AiFeatureTab,
+    selectedAiCategory: FileCategory,
+    aiCategoryCounts: Map<FileCategory, Int>,
+    selectedAiSortField: AiSortField,
+    aiSortOrder: SortOrder,
     semanticQuery: String,
     semanticResults: List<SemanticSearchResult>,
     dynamicLenses: List<DynamicLensGroup>,
@@ -110,6 +120,9 @@ fun AiSearchScreen(
     allFiles: List<PhoneFileItem>,
     ragMessages: List<RagChatMessage>,
     onSelectAiTab: (AiFeatureTab) -> Unit,
+    onSelectAiCategory: (FileCategory) -> Unit,
+    onSelectAiSortField: (AiSortField) -> Unit,
+    onToggleAiSortOrder: () -> Unit,
     onUpdateSemanticQuery: (String) -> Unit,
     onApplyRename: (RenameSuggestion) -> Unit,
     onToggleJunkReview: (String) -> Unit,
@@ -127,6 +140,13 @@ fun AiSearchScreen(
     if (!aiSettings.masterAiEnabled) {
         MasterAiDisabledFallbackView(
             allFiles = allFiles,
+            selectedAiCategory = selectedAiCategory,
+            aiCategoryCounts = aiCategoryCounts,
+            selectedAiSortField = selectedAiSortField,
+            aiSortOrder = aiSortOrder,
+            onSelectAiCategory = onSelectAiCategory,
+            onSelectAiSortField = onSelectAiSortField,
+            onToggleAiSortOrder = onToggleAiSortOrder,
             onEnableMasterAi = onEnableMasterAi,
             onFileClicked = onFileClicked,
             onCopyPath = onCopyPath,
@@ -143,7 +163,7 @@ fun AiSearchScreen(
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // 1. On-Device AI Status Header + Feature Mode Selector
+        // 1. On-Device AI Status Header + Feature Mode Selector + File Type & Sort Controls
         item(key = "ai_header") {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Row(
@@ -227,6 +247,23 @@ fun AiSearchScreen(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+
+                // File Type Dropdown Selector (same FileCategory list as Standard screen)
+                AiFileTypeDropdownBar(
+                    selectedCategory = selectedAiCategory,
+                    categoryCounts = aiCategoryCounts,
+                    onSelectCategory = onSelectAiCategory
+                )
+
+                // Single-Row Sort Controls (Sort By Dropdown + Ascending/Descending Toggle) matching Standard screen
+                if (selectedAiTab != AiFeatureTab.DOCUMENT_QA) {
+                    AiSortControlBar(
+                        selectedSortField = selectedAiSortField,
+                        sortOrder = aiSortOrder,
+                        onSelectSortField = onSelectAiSortField,
+                        onToggleSortOrder = onToggleAiSortOrder
+                    )
+                }
             }
         }
 
@@ -246,6 +283,7 @@ fun AiSearchScreen(
                 ) { result ->
                     SemanticResultCard(
                         result = result,
+                        activeSortField = selectedAiSortField,
                         appliedRename = appliedRenames[result.file.id],
                         onFileClicked = onFileClicked,
                         onCopyPath = onCopyPath,
@@ -307,9 +345,13 @@ fun AiSearchScreen(
 
             AiFeatureTab.DOCUMENT_QA -> {
                 item(key = "doc_qa_section") {
+                    val categoryFilteredRagFiles = remember(allFiles, selectedAiCategory) {
+                        if (selectedAiCategory == FileCategory.ALL) allFiles
+                        else allFiles.filter { it.category == selectedAiCategory }.ifEmpty { allFiles }
+                    }
                     DocumentQaRagSection(
                         selectedFile = selectedRagFile,
-                        allFiles = allFiles,
+                        allFiles = categoryFilteredRagFiles,
                         messages = ragMessages,
                         onSelectDocument = onSelectRagDocument,
                         onSendQuestion = onSendRagQuestion
@@ -321,8 +363,294 @@ fun AiSearchScreen(
 }
 
 @Composable
+private fun AiFileTypeDropdownBar(
+    selectedCategory: FileCategory,
+    categoryCounts: Map<FileCategory, Int>,
+    onSelectCategory: (FileCategory) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var fileTypeMenuExpanded by remember { mutableStateOf(false) }
+
+    Box(modifier = modifier.fillMaxWidth()) {
+        Surface(
+            onClick = { fileTypeMenuExpanded = !fileTypeMenuExpanded },
+            modifier = Modifier
+                .fillMaxWidth()
+                .minimumInteractiveComponentSize()
+                .testTag("ai_file_type_dropdown_trigger"),
+            shape = MaterialTheme.shapes.medium,
+            color = MaterialTheme.colorScheme.surface,
+            border = BorderStroke(
+                width = 1.dp,
+                color = if (selectedCategory != FileCategory.ALL || fileTypeMenuExpanded) {
+                    MaterialTheme.colorScheme.primary
+                } else {
+                    MaterialTheme.colorScheme.outline
+                }
+            )
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 11.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(
+                        imageVector = categoryIcon(selectedCategory),
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Text(
+                        text = selectedCategory.displayName,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        text = "${categoryCounts[selectedCategory] ?: 0}",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Icon(
+                        imageVector = Icons.Default.ArrowDropDown,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(22.dp)
+                    )
+                }
+            }
+        }
+
+        DropdownMenu(
+            expanded = fileTypeMenuExpanded,
+            onDismissRequest = { fileTypeMenuExpanded = false },
+            modifier = Modifier.fillMaxWidth(0.92f),
+            containerColor = MaterialTheme.colorScheme.surface
+        ) {
+            FileCategory.entries.forEach { category ->
+                val isSelected = category == selectedCategory
+                val count = categoryCounts[category] ?: 0
+                DropdownMenuItem(
+                    modifier = Modifier.testTag("ai_dropdown_category_${category.name}"),
+                    leadingIcon = {
+                        Icon(
+                            imageVector = categoryIcon(category),
+                            contentDescription = null,
+                            tint = if (isSelected) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            }
+                        )
+                    },
+                    text = {
+                        Column {
+                            Text(
+                                text = category.displayName,
+                                style = MaterialTheme.typography.bodyLarge,
+                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                color = if (isSelected) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurface
+                                }
+                            )
+                            Text(
+                                text = category.extensionsHint,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    },
+                    trailingIcon = {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = "$count",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = if (isSelected) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                }
+                            )
+                            if (isSelected) {
+                                Icon(
+                                    imageVector = Icons.Default.Check,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        }
+                    },
+                    onClick = {
+                        onSelectCategory(category)
+                        fileTypeMenuExpanded = false
+                    }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun AiSortControlBar(
+    selectedSortField: AiSortField,
+    sortOrder: SortOrder,
+    onSelectSortField: (AiSortField) -> Unit,
+    onToggleSortOrder: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var sortMenuExpanded by remember { mutableStateOf(false) }
+
+    Row(
+        modifier = modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Box {
+            Surface(
+                onClick = { sortMenuExpanded = true },
+                modifier = Modifier
+                    .height(36.dp)
+                    .testTag("ai_sort_by_dropdown_trigger"),
+                shape = MaterialTheme.shapes.small,
+                color = MaterialTheme.colorScheme.surface,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.Sort,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(15.dp)
+                    )
+                    Text(
+                        text = "Sort: ${selectedSortField.displayName}",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Icon(
+                        imageVector = Icons.Default.ArrowDropDown,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+
+            DropdownMenu(
+                expanded = sortMenuExpanded,
+                onDismissRequest = { sortMenuExpanded = false },
+                containerColor = MaterialTheme.colorScheme.surface
+            ) {
+                AiSortField.entries.forEach { field ->
+                    val isCurrent = field == selectedSortField
+                    DropdownMenuItem(
+                        modifier = Modifier.testTag("ai_sort_menu_item_${field.name}"),
+                        text = {
+                            Column {
+                                Text(
+                                    text = field.displayName,
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal,
+                                    color = if (isCurrent) {
+                                        MaterialTheme.colorScheme.primary
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurface
+                                    }
+                                )
+                                Text(
+                                    text = field.description,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        },
+                        trailingIcon = {
+                            if (isCurrent) {
+                                Icon(
+                                    imageVector = Icons.Default.Check,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        },
+                        onClick = {
+                            onSelectSortField(field)
+                            sortMenuExpanded = false
+                        }
+                    )
+                }
+            }
+        }
+
+        Surface(
+            onClick = onToggleSortOrder,
+            modifier = Modifier
+                .height(36.dp)
+                .testTag("ai_sort_order_toggle"),
+            shape = MaterialTheme.shapes.small,
+            color = MaterialTheme.colorScheme.surface,
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Icon(
+                    imageVector = if (sortOrder == SortOrder.ASCENDING) {
+                        Icons.Default.ArrowUpward
+                    } else {
+                        Icons.Default.ArrowDownward
+                    },
+                    contentDescription = "Toggle AI sort order",
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(15.dp)
+                )
+                Text(
+                    text = sortOrder.displayName,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun MasterAiDisabledFallbackView(
     allFiles: List<PhoneFileItem>,
+    selectedAiCategory: FileCategory,
+    aiCategoryCounts: Map<FileCategory, Int>,
+    selectedAiSortField: AiSortField,
+    aiSortOrder: SortOrder,
+    onSelectAiCategory: (FileCategory) -> Unit,
+    onSelectAiSortField: (AiSortField) -> Unit,
+    onToggleAiSortOrder: () -> Unit,
     onEnableMasterAi: () -> Unit,
     onFileClicked: (PhoneFileItem) -> Unit,
     onCopyPath: (String) -> Unit,
@@ -330,10 +658,33 @@ private fun MasterAiDisabledFallbackView(
     modifier: Modifier = Modifier
 ) {
     var fallbackQuery by remember { mutableStateOf("") }
-    val filtered = remember(allFiles, fallbackQuery) {
+    val filtered = remember(allFiles, fallbackQuery, selectedAiCategory, selectedAiSortField, aiSortOrder) {
+        val categoryFiltered = if (selectedAiCategory == FileCategory.ALL) {
+            allFiles
+        } else {
+            allFiles.filter { it.category == selectedAiCategory }
+        }
         val q = fallbackQuery.trim().lowercase(Locale.ROOT)
-        if (q.isEmpty()) allFiles.take(12)
-        else allFiles.filter { it.name.lowercase(Locale.ROOT).contains(q) }
+        val matched = if (q.isEmpty()) categoryFiltered.take(20)
+        else categoryFiltered.filter { it.name.lowercase(Locale.ROOT).contains(q) }
+        val comparator: Comparator<PhoneFileItem> = when (selectedAiSortField) {
+            AiSortField.RELEVANCE, AiSortField.MODIFIED_DATE ->
+                compareBy<PhoneFileItem> { it.modifiedAtMillis }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { it.name }
+            AiSortField.NAME ->
+                compareBy<PhoneFileItem, String>(String.CASE_INSENSITIVE_ORDER) { it.name }
+            AiSortField.SIZE ->
+                compareBy<PhoneFileItem> { it.sizeBytes }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { it.name }
+            AiSortField.CREATED_DATE ->
+                compareBy<PhoneFileItem> { it.createdAtMillis }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { it.name }
+            AiSortField.EXTENSION ->
+                compareBy<PhoneFileItem, String>(String.CASE_INSENSITIVE_ORDER) { it.extension }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { it.name }
+        }
+        if (aiSortOrder == SortOrder.ASCENDING) matched.sortedWith(comparator)
+        else matched.sortedWith(comparator.reversed())
     }
 
     LazyColumn(
@@ -389,6 +740,14 @@ private fun MasterAiDisabledFallbackView(
         }
 
         item {
+            AiFileTypeDropdownBar(
+                selectedCategory = selectedAiCategory,
+                categoryCounts = aiCategoryCounts,
+                onSelectCategory = onSelectAiCategory
+            )
+        }
+
+        item {
             OutlinedTextField(
                 value = fallbackQuery,
                 onValueChange = { fallbackQuery = it },
@@ -396,6 +755,15 @@ private fun MasterAiDisabledFallbackView(
                 singleLine = true,
                 placeholder = { Text("Lightweight filename-only search…") },
                 leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) }
+            )
+        }
+
+        item {
+            AiSortControlBar(
+                selectedSortField = selectedAiSortField,
+                sortOrder = aiSortOrder,
+                onSelectSortField = onSelectAiSortField,
+                onToggleSortOrder = onToggleAiSortOrder
             )
         }
 
@@ -420,7 +788,7 @@ private fun MasterAiDisabledFallbackView(
                             color = MaterialTheme.colorScheme.onSurface
                         )
                         Text(
-                            text = file.fullPath,
+                            text = "${file.formattedSize()} • ${file.fullPath}",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -518,6 +886,7 @@ private fun SemanticSearchInputSection(
 @Composable
 private fun SemanticResultCard(
     result: SemanticSearchResult,
+    activeSortField: AiSortField,
     appliedRename: String?,
     onFileClicked: (PhoneFileItem) -> Unit,
     onCopyPath: (String) -> Unit,
@@ -525,6 +894,11 @@ private fun SemanticResultCard(
 ) {
     val file = result.file
     val similarityPct = (result.cosineSimilarity * 100).toInt().coerceIn(1, 99)
+    val dateLabel = if (activeSortField == AiSortField.CREATED_DATE) {
+        "Created ${file.formattedShortDate(file.createdAtMillis)}"
+    } else {
+        "Modified ${file.formattedShortDate(file.modifiedAtMillis)}"
+    }
 
     Card(
         modifier = Modifier
@@ -571,7 +945,7 @@ private fun SemanticResultCard(
                         overflow = TextOverflow.Ellipsis
                     )
                     Text(
-                        text = "${result.lensTag} • ${file.formattedSize()} • ${file.storageLocation.displayName}",
+                        text = "${result.lensTag} • ${file.formattedSize()} • $dateLabel • ${file.storageLocation.displayName}",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.primary
                     )
@@ -673,7 +1047,10 @@ private fun DynamicLensCard(
             .clickable { expanded = !expanded },
         shape = MaterialTheme.shapes.medium,
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+        border = BorderStroke(
+            width = 1.dp,
+            color = if (lens.isUserPreset) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
+        )
     ) {
         Column(
             modifier = Modifier.padding(14.dp),
@@ -685,6 +1062,11 @@ private fun DynamicLensCard(
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = if (lens.isUserPreset) "PRE-SET LENS (SETTINGS)" else "AUTO-GROUPED BY AI",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (lens.isUserPreset) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.tertiary
+                    )
                     Text(
                         text = lens.title,
                         style = MaterialTheme.typography.titleMedium,

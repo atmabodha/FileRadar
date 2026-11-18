@@ -14,8 +14,6 @@ import com.example.model.FileCategory
 import com.example.model.PhoneFileItem
 import com.example.model.StorageLocation
 import java.io.File
-import java.nio.file.Files
-import java.nio.file.attribute.BasicFileAttributes
 import java.util.ArrayDeque
 import java.util.Locale
 import kotlinx.coroutines.Dispatchers
@@ -116,7 +114,7 @@ class PhoneFileScannerRepository(private val context: Context) {
             // Ignore
         }
 
-        // 2. Walk readable directories across Internal Storage (/storage/emulated/0, Download, Documents, etc.) & SD Card
+        // 2. Walk readable directories across Internal Storage & SD Card (deduplicated & capped)
         val directFsItems = walkAccessibleDirectories(
             mountedVolumeDirs = mountedVolumeDirs,
             sdVolumeLabel = detectedSdVolumeName
@@ -125,7 +123,7 @@ class PhoneFileScannerRepository(private val context: Context) {
             discoveredByPath.putIfAbsent(item.fullPath, item)
         }
 
-        // 3. Query MediaStore (Files, Downloads, Images, Video, Audio) with no artificial row limit
+        // 3. Query MediaStore (Files, Downloads, Images, Video, Audio) with safe row cap
         val mediaStoreItems = queryMediaStoreFiles(
             contentResolver = context.contentResolver,
             sdVolumeLabel = detectedSdVolumeName
@@ -146,7 +144,7 @@ class PhoneFileScannerRepository(private val context: Context) {
             }
         }
 
-        // 5. Include built-in sample index ONLY if requested OR if no real device files were found (e.g., empty cloud emulator)
+        // 5. Include built-in sample index ONLY if requested OR if no real device files were found
         val shouldIncludeSamples = if (fullAccessGranted && discoveredByPath.isNotEmpty()) {
             includeSampleIndex
         } else {
@@ -154,7 +152,7 @@ class PhoneFileScannerRepository(private val context: Context) {
         }
 
         if (shouldIncludeSamples) {
-            val seededItems = ensureAndScanPhysicalStorageFiles(
+            val seededItems = buildSampleStorageFiles(
                 sdVolumeUuid = detectedSdVolumeUuid,
                 sdVolumeLabel = detectedSdVolumeName
             )
@@ -171,12 +169,10 @@ class PhoneFileScannerRepository(private val context: Context) {
         sdVolumeLabel: String
     ): List<PhoneFileItem> {
         val found = LinkedHashMap<String, PhoneFileItem>()
+        val visitedDirs = HashSet<String>()
         val candidateRoots = mutableListOf<Pair<File, Boolean>>()
 
-        // Add full storage roots (/storage/emulated/0 and removable SD card roots)
-        candidateRoots.addAll(mountedVolumeDirs)
-
-        // Add standard public directories on primary storage explicitly in case root listing is restricted
+        // Prioritize standard user-facing public directories first so Downloads, Documents, DCIM, etc. are always scanned first
         val publicDirs = listOf(
             Environment.DIRECTORY_DOWNLOADS,
             Environment.DIRECTORY_DOCUMENTS,
@@ -199,6 +195,9 @@ class PhoneFileScannerRepository(private val context: Context) {
             }
         }
 
+        // Then add full storage roots (/storage/emulated/0 and removable SD card roots)
+        candidateRoots.addAll(mountedVolumeDirs)
+
         // Add app external dirs
         val externalDirs = context.getExternalFilesDirs(null).filterNotNull()
         externalDirs.forEachIndexed { index, rootDir ->
@@ -210,48 +209,61 @@ class PhoneFileScannerRepository(private val context: Context) {
             candidateRoots.add(rootDir to isRemovable)
         }
 
+        val nowMs = System.currentTimeMillis()
+
         for ((rootDir, isRemovable) in candidateRoots) {
+            if (found.size >= MAX_WALKED_FILES) break
             val storageLocation = if (isRemovable) StorageLocation.SD_CARD else StorageLocation.INTERNAL
             val volumeLabel = if (isRemovable) sdVolumeLabel else "Internal Shared Storage"
 
             try {
                 rootDir.walkTopDown()
                     .onEnter { dir ->
+                        if (found.size >= MAX_WALKED_FILES) return@onEnter false
                         val name = dir.name
                         if (name.startsWith(".")) return@onEnter false
-                        // Skip restricted/cache Android/data and Android/obb trees so full phone scan stays fast
+                        val lowerName = name.lowercase(Locale.ROOT)
+                        if (lowerName in SKIPPED_DIR_NAMES) return@onEnter false
+
                         val path = dir.absolutePath
-                        if (path.endsWith("/Android/data") || path.endsWith("/Android/obb")) {
+                        if (path.endsWith("/Android/data") ||
+                            path.endsWith("/Android/obb") ||
+                            path.endsWith("/Android/media")
+                        ) {
                             return@onEnter false
                         }
-                        true
+                        // Deduplicate directory traversal across overlapping candidateRoots
+                        visitedDirs.add(path)
                     }
-                    .maxDepth(14)
-                    .filter { it.isFile && it.length() > 0L && !it.name.startsWith(".") }
+                    .maxDepth(8)
                     .forEach { file ->
+                        if (found.size >= MAX_WALKED_FILES) return@forEach
+                        if (!file.isFile || file.name.startsWith(".")) return@forEach
+                        val fullPath = file.absolutePath
+                        if (found.containsKey(fullPath)) return@forEach
+
+                        val sizeBytes = file.length()
+                        if (sizeBytes <= 0L) return@forEach
+
                         val ext = resolveExtension(file.name, null)
                         if (ext.isNotEmpty()) {
-                            val createdMs = readCreationTimeMillis(file)
-                            val modifiedMs = file.lastModified().takeIf { it > 0L } ?: createdMs
+                            val modifiedMs = file.lastModified().takeIf { it > 0L } ?: nowMs
                             val mime = MimeTypeMap.getSingleton()
                                 .getMimeTypeFromExtension(ext.lowercase(Locale.ROOT))
                                 ?: "application/octet-stream"
 
-                            found.putIfAbsent(
-                                file.absolutePath,
-                                PhoneFileItem(
-                                    id = file.absolutePath,
-                                    name = file.name,
-                                    extension = ext,
-                                    fullPath = file.absolutePath,
-                                    sizeBytes = file.length(),
-                                    createdAtMillis = createdMs,
-                                    modifiedAtMillis = modifiedMs,
-                                    storageLocation = storageLocation,
-                                    volumeLabel = volumeLabel,
-                                    category = FileCategory.fromExtension(ext, mime),
-                                    mimeType = mime
-                                )
+                            found[fullPath] = PhoneFileItem(
+                                id = fullPath,
+                                name = file.name,
+                                extension = ext,
+                                fullPath = fullPath,
+                                sizeBytes = sizeBytes,
+                                createdAtMillis = modifiedMs,
+                                modifiedAtMillis = modifiedMs,
+                                storageLocation = storageLocation,
+                                volumeLabel = volumeLabel,
+                                category = FileCategory.fromExtension(ext, mime),
+                                mimeType = mime
                             )
                         }
                     }
@@ -286,7 +298,7 @@ class PhoneFileScannerRepository(private val context: Context) {
             DocumentsContract.Document.COLUMN_LAST_MODIFIED
         )
 
-        while (queue.isNotEmpty() && visitedDirs.size < 1500) {
+        while (queue.isNotEmpty() && visitedDirs.size < 400 && results.size < 1500) {
             val parentDocId = queue.removeFirst()
             if (!visitedDirs.add(parentDocId)) continue
 
@@ -304,7 +316,7 @@ class PhoneFileScannerRepository(private val context: Context) {
                     val sizeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
                     val modIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
 
-                    while (cursor.moveToNext()) {
+                    while (cursor.moveToNext() && results.size < 1500) {
                         val docId = if (idIdx >= 0) cursor.getString(idIdx) else null ?: continue
                         val displayName = if (nameIdx >= 0) cursor.getString(nameIdx) else null ?: continue
                         if (displayName.startsWith(".")) continue
@@ -454,6 +466,7 @@ class PhoneFileScannerRepository(private val context: Context) {
             urisToQuery.add(MediaStore.Audio.Media.getContentUri(volumeName))
 
             for (uri in urisToQuery) {
+                if (items.size >= MAX_MEDIASTORE_FILES) break
                 try {
                     contentResolver.query(
                         uri,
@@ -472,7 +485,9 @@ class PhoneFileScannerRepository(private val context: Context) {
                             cursor.getColumnIndex(MediaStore.Files.FileColumns.RELATIVE_PATH)
                         } else -1
 
-                        while (cursor.moveToNext()) {
+                        var rowCount = 0
+                        while (cursor.moveToNext() && rowCount < 1200 && items.size < MAX_MEDIASTORE_FILES) {
+                            rowCount++
                             val displayName = if (nameIdx >= 0) cursor.getString(nameIdx) else null
                             if (displayName.isNullOrBlank()) continue
                             val size = if (sizeIdx >= 0) cursor.getLong(sizeIdx) else 0L
@@ -493,6 +508,8 @@ class PhoneFileScannerRepository(private val context: Context) {
                                 else -> "$mountPrefix/Download/$displayName"
                             }
 
+                            if (items.containsKey(fullPath)) continue
+
                             val resolvedMime = mime ?: MimeTypeMap.getSingleton()
                                 .getMimeTypeFromExtension(ext.lowercase(Locale.ROOT))
                                 ?: "application/octet-stream"
@@ -500,21 +517,18 @@ class PhoneFileScannerRepository(private val context: Context) {
                             val createdMs = if (addedSec > 0L) addedSec * 1000L else System.currentTimeMillis()
                             val modifiedMs = if (modSec > 0L) modSec * 1000L else createdMs
 
-                            items.putIfAbsent(
-                                fullPath,
-                                PhoneFileItem(
-                                    id = fullPath,
-                                    name = displayName,
-                                    extension = ext,
-                                    fullPath = fullPath,
-                                    sizeBytes = size,
-                                    createdAtMillis = createdMs,
-                                    modifiedAtMillis = modifiedMs,
-                                    storageLocation = storageLoc,
-                                    volumeLabel = volumeLabel,
-                                    category = FileCategory.fromExtension(ext, resolvedMime),
-                                    mimeType = resolvedMime
-                                )
+                            items[fullPath] = PhoneFileItem(
+                                id = fullPath,
+                                name = displayName,
+                                extension = ext,
+                                fullPath = fullPath,
+                                sizeBytes = size,
+                                createdAtMillis = createdMs,
+                                modifiedAtMillis = modifiedMs,
+                                storageLocation = storageLoc,
+                                volumeLabel = volumeLabel,
+                                category = FileCategory.fromExtension(ext, resolvedMime),
+                                mimeType = resolvedMime
                             )
                         }
                     }
@@ -526,7 +540,7 @@ class PhoneFileScannerRepository(private val context: Context) {
         return items.values.toList()
     }
 
-    private fun ensureAndScanPhysicalStorageFiles(
+    private fun buildSampleStorageFiles(
         sdVolumeUuid: String,
         sdVolumeLabel: String
     ): List<PhoneFileItem> {
@@ -539,7 +553,9 @@ class PhoneFileScannerRepository(private val context: Context) {
         val internalLabel = "Internal Shared Storage"
 
         val specs = listOf(
-            // ================= 26 PDF DOCUMENTS (Internal Storage & SD Card) =================
+            // ================= PDF DOCUMENTS (Internal Storage & SD Card) =================
+            SeedFileSpec(internalMount, "Download/CBC_Lipid_Blood_Report_Nov2026.pdf", StorageLocation.INTERNAL, internalLabel, 684_032L, 3, 9, "application/pdf"),
+            SeedFileSpec(internalMount, "Documents/Medical/Annual_Pathology_Blood_Test_Panel.pdf", StorageLocation.INTERNAL, internalLabel, 1_245_184L, 21, 140, "application/pdf"),
             SeedFileSpec(internalMount, "Download/Q4_Financial_Audit_2026.pdf", StorageLocation.INTERNAL, internalLabel, 4_852_190L, 14, 6, "application/pdf"),
             SeedFileSpec(internalMount, "Download/Monthly_Bank_Statement_Oct2026.pdf", StorageLocation.INTERNAL, internalLabel, 1_128_448L, 18, 40, "application/pdf"),
             SeedFileSpec(internalMount, "Download/Monthly_Bank_Statement_Sep2026.pdf", StorageLocation.INTERNAL, internalLabel, 1_094_656L, 48, 210, "application/pdf"),
@@ -612,28 +628,12 @@ class PhoneFileScannerRepository(private val context: Context) {
             SeedFileSpec(sdMount, "Configs/wireguard_mesh_routing_table.json", StorageLocation.SD_CARD, sdVolumeLabel, 18_432L, 29, 215, "application/json")
         )
 
-        val mirrorRoot = File(context.filesDir, "storage_index_mirror")
         val results = ArrayList<PhoneFileItem>(specs.size)
 
         for (spec in specs) {
-            val mountFolder = if (spec.storageLocation == StorageLocation.INTERNAL) "internal" else "sdcard"
-            val physicalFile = File(File(mirrorRoot, mountFolder), spec.relativePath)
             val createdMillis = now - (spec.createdDaysAgo * dayMs)
             val modifiedMillis = now - (spec.modifiedHoursAgo * hourMs)
-
-            try {
-                physicalFile.parentFile?.mkdirs()
-                if (!physicalFile.exists()) {
-                    physicalFile.writeText(
-                        "FILE_RADAR_INDEXED_HEADER\nPATH=${spec.virtualMountRoot}/${spec.relativePath}\nSIZE=${spec.logicalSizeBytes}\n"
-                    )
-                    physicalFile.setLastModified(modifiedMillis)
-                }
-            } catch (_: Throwable) {
-                // Ignore IO error if storage is read-only
-            }
-
-            val fileName = physicalFile.name
+            val fileName = spec.relativePath.substringAfterLast('/')
             val ext = resolveExtension(fileName, spec.mimeType)
             val canonicalPhonePath = "${spec.virtualMountRoot}/${spec.relativePath}"
 
@@ -645,7 +645,7 @@ class PhoneFileScannerRepository(private val context: Context) {
                     fullPath = canonicalPhonePath,
                     sizeBytes = spec.logicalSizeBytes,
                     createdAtMillis = createdMillis,
-                    modifiedAtMillis = physicalFile.lastModified().takeIf { it > 0L } ?: modifiedMillis,
+                    modifiedAtMillis = modifiedMillis,
                     storageLocation = spec.storageLocation,
                     volumeLabel = spec.volumeLabel,
                     category = FileCategory.fromExtension(ext, spec.mimeType),
@@ -655,19 +655,6 @@ class PhoneFileScannerRepository(private val context: Context) {
         }
 
         return results
-    }
-
-    private fun readCreationTimeMillis(file: File): Long {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            try {
-                val attrs = Files.readAttributes(file.toPath(), BasicFileAttributes::class.java)
-                val creationMs = attrs.creationTime().toMillis()
-                if (creationMs > 0L) return creationMs
-            } catch (_: Throwable) {
-                // Fallback to lastModified
-            }
-        }
-        return file.lastModified().takeIf { it > 0L } ?: System.currentTimeMillis()
     }
 
     private fun resolveExtension(fileName: String, mimeType: String?): String {
@@ -683,5 +670,20 @@ class PhoneFileScannerRepository(private val context: Context) {
             if (mimeType.equals("application/pdf", ignoreCase = true)) return "pdf"
         }
         return ""
+    }
+
+    companion object {
+        private const val MAX_WALKED_FILES = 2500
+        private const val MAX_MEDIASTORE_FILES = 2500
+
+        private val SKIPPED_DIR_NAMES = setOf(
+            "cache",
+            "code_cache",
+            "thumbnails",
+            ".thumbnails",
+            "node_modules",
+            "temp",
+            "tmp"
+        )
     }
 }

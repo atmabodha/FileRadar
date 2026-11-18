@@ -61,12 +61,41 @@ class ExampleRobolectricTest {
         composeTestRule.onNodeWithTag("ai_search_screen")
             .assertIsDisplayed()
 
+        composeTestRule.onNodeWithTag("ai_file_type_dropdown_trigger")
+            .assertIsDisplayed()
+            .performClick()
+
+        composeTestRule.onNodeWithTag("ai_dropdown_category_PDF")
+            .assertIsDisplayed()
+            .performClick()
+
+        composeTestRule.onNodeWithTag("ai_sort_by_dropdown_trigger")
+            .assertIsDisplayed()
+            .performClick()
+
+        composeTestRule.onNodeWithTag("ai_sort_menu_item_SIZE")
+            .assertIsDisplayed()
+            .performClick()
+
+        composeTestRule.onNodeWithTag("ai_sort_order_toggle")
+            .assertIsDisplayed()
+            .performClick()
+
         composeTestRule.onNodeWithTag("nav_tab_settings")
             .assertIsDisplayed()
             .performClick()
 
         composeTestRule.onNodeWithTag("ai_settings_screen")
             .assertIsDisplayed()
+
+        composeTestRule.onNodeWithTag("preset_lens_input")
+            .assertExists()
+
+        composeTestRule.onNodeWithTag("preset_lens_chip_Blood Report")
+            .assertExists()
+
+        composeTestRule.onNodeWithTag("preset_lens_chip_Bank Records")
+            .assertExists()
 
         composeTestRule.onNodeWithTag("nav_tab_standard")
             .assertIsDisplayed()

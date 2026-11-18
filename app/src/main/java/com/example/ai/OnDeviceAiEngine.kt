@@ -18,6 +18,13 @@ import kotlin.math.sqrt
 
 class OnDeviceAiEngine(private val context: Context) {
 
+    private data class CompiledPreset(
+        val label: String,
+        val labelTokens: List<String>,
+        val expandedKeywords: List<String>,
+        val embedding: FloatArray
+    )
+
     // AppSearch-style in-memory document vector store: fileId -> list of chunk vectors & text
     private val fileChunkStore = ConcurrentHashMap<String, List<DocumentChunk>>()
 
@@ -62,7 +69,10 @@ class OnDeviceAiEngine(private val context: Context) {
         chunkSizeTokens: Int,
         chunkOverlapTokens: Int
     ): List<DocumentChunk> {
-        val rawContent = extractFileTextContent(file)
+        fileChunkStore[file.id]?.let { existing ->
+            if (existing.isNotEmpty()) return existing
+        }
+        val rawContent = extractFileTextContent(file, allowDiskRead = true)
         val chunks = chunkTextBySentences(
             fileId = file.id,
             fileName = file.name,
@@ -153,24 +163,27 @@ class OnDeviceAiEngine(private val context: Context) {
     }
 
     /**
-     * Step 4 of Plan: Multi-chunk vector cosine similarity search across all indexed files.
+     * Step 4 of Plan: Multi-chunk vector cosine similarity search across indexed files.
      */
     fun performSemanticSearch(
         query: String,
-        files: List<PhoneFileItem>
+        files: List<PhoneFileItem>,
+        presetLabels: List<String> = DEFAULT_PRESET_LENS_LABELS
     ): List<SemanticSearchResult> {
+        val compiledPresets = buildCompiledPresets(presetLabels)
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) {
             return files.take(15).map { file ->
                 val chunks = fileChunkStore[file.id].orEmpty()
-                val firstSnippet = chunks.firstOrNull()?.text ?: extractFileTextContent(file)
+                val firstSnippet = chunks.firstOrNull()?.text
+                    ?: extractFileTextContent(file, allowDiskRead = false)
                 SemanticSearchResult(
                     file = file,
                     cosineSimilarity = 0.88f,
                     matchedSnippet = firstSnippet.take(180),
                     matchedChunkIndex = 0,
                     totalFileChunks = chunks.size.coerceAtLeast(1),
-                    lensTag = classifyLensCategory(file)
+                    lensTag = resolveLensTagWithCompiledPresets(file, compiledPresets)
                 )
             }
         }
@@ -178,9 +191,30 @@ class OnDeviceAiEngine(private val context: Context) {
         val queryEmbedding = computeSemanticEmbedding(cleanQuery)
         val queryTokens = tokenizeWords(cleanQuery)
         val results = mutableListOf<SemanticSearchResult>()
+        var onDemandIndexedCount = 0
 
         for (file in files) {
-            val chunks = fileChunkStore[file.id] ?: indexSingleFile(file, 256, 30)
+            val existingChunks = fileChunkStore[file.id]
+            val chunks: List<DocumentChunk> = if (existingChunks != null) {
+                existingChunks
+            } else if (onDemandIndexedCount < 60) {
+                onDemandIndexedCount++
+                indexSingleFile(file, 256, 30)
+            } else {
+                // Lightweight fallback chunk without disk read when scanning large file sets
+                val fastText = extractFileTextContent(file, allowDiskRead = false)
+                listOf(
+                    DocumentChunk(
+                        fileId = file.id,
+                        fileName = file.name,
+                        chunkIndex = 0,
+                        text = fastText,
+                        estimatedTokens = (fastText.length / 4).coerceAtLeast(1),
+                        embedding = computeSemanticEmbedding(fastText)
+                    )
+                )
+            }
+
             var bestScore = -1f
             var bestChunk: DocumentChunk? = null
 
@@ -205,64 +239,295 @@ class OnDeviceAiEngine(private val context: Context) {
                         matchedSnippet = bestChunk.text,
                         matchedChunkIndex = bestChunk.chunkIndex,
                         totalFileChunks = chunks.size,
-                        lensTag = classifyLensCategory(file)
+                        lensTag = resolveLensTagWithCompiledPresets(file, compiledPresets)
                     )
                 )
             }
         }
 
-        return results.sortedByDescending { it.cosineSimilarity }
+        return results.sortedByDescending { it.cosineSimilarity }.take(100)
     }
 
     /**
-     * Dynamic Lenses (Smart Collections): Groups files by semantic context without duplicating files.
+     * Dynamic Lenses (Smart Collections):
+     * Stage 1: Matches files against user-configured Pre-Set Lens names (e.g., "Blood Report", "Bank Records").
+     * Stage 2: Anything that does not fit into the user's pre-set labels is automatically grouped and named by AI.
      */
-    fun buildDynamicLenses(files: List<PhoneFileItem>): List<DynamicLensGroup> {
-        val grouped = files.groupBy { classifyLensCategory(it) }
-        val lensDefinitions = listOf(
-            Triple(
-                "Invoices, Tax & Statements",
-                "Receipts, billing statements, tax returns, and financial ledgers",
-                grouped["Invoices, Tax & Statements"].orEmpty()
-            ),
-            Triple(
-                "Travel & Boarding Passes",
-                "Flight itineraries, rail passes, hotel bookings, and visa scans",
-                grouped["Travel & Boarding Passes"].orEmpty()
-            ),
-            Triple(
-                "Engineering, Books & Manuals",
-                "Technical handbooks, hardware schematics, research papers, and specs",
-                grouped["Engineering, Books & Manuals"].orEmpty()
-            ),
-            Triple(
-                "Scenic Photos & Drone Media",
-                "Landscapes, astrophotography RAWs, 4K drone footage, and screenshots",
-                grouped["Scenic Photos & Drone Media"].orEmpty()
-            ),
-            Triple(
-                "Audio, Voice Notes & Podcasts",
-                "Meeting recordings, lossless studio audio, and binaural field samples",
-                grouped["Audio, Voice Notes & Podcasts"].orEmpty()
-            ),
-            Triple(
-                "System Backups & Packages",
-                "Compressed archives, SDK bundles, APKs, and diagnostic logs",
-                grouped["System Backups & Packages"].orEmpty()
-            )
-        )
+    fun buildDynamicLenses(
+        files: List<PhoneFileItem>,
+        presetLabels: List<String> = DEFAULT_PRESET_LENS_LABELS
+    ): List<DynamicLensGroup> {
+        val compiledPresets = buildCompiledPresets(presetLabels)
 
-        return lensDefinitions
-            .filter { it.third.isNotEmpty() }
-            .map { (title, desc, groupFiles) ->
-                DynamicLensGroup(
-                    id = title,
-                    title = title,
-                    description = desc,
-                    files = groupFiles,
-                    totalBytes = groupFiles.sumOf { it.sizeBytes }
+        val presetBuckets = LinkedHashMap<String, MutableList<PhoneFileItem>>()
+        compiledPresets.forEach { preset ->
+            presetBuckets[preset.label] = mutableListOf()
+        }
+
+        val unmatchedFiles = mutableListOf<PhoneFileItem>()
+
+        // Stage 1: Evaluate each file against pre-compiled User Pre-Set Lens matchers
+        for (file in files) {
+            val matchedPreset = matchFileToCompiledPresets(file, compiledPresets)
+            if (matchedPreset != null) {
+                presetBuckets.getOrPut(matchedPreset) { mutableListOf() }.add(file)
+            } else {
+                unmatchedFiles.add(file)
+            }
+        }
+
+        val finalGroups = mutableListOf<DynamicLensGroup>()
+
+        // Add User Pre-Set Lens Groups first
+        for ((presetTitle, matchedList) in presetBuckets) {
+            if (matchedList.isNotEmpty()) {
+                finalGroups.add(
+                    DynamicLensGroup(
+                        id = "preset_${presetTitle.lowercase(Locale.ROOT)}",
+                        title = presetTitle,
+                        description = "User Pre-Set Lens • Matched by on-device content & semantic keywords",
+                        files = matchedList,
+                        totalBytes = matchedList.sumOf { it.sizeBytes },
+                        isUserPreset = true
+                    )
                 )
             }
+        }
+
+        // Stage 2: Automatically group and name all remaining files that did not fit into Pre-Set labels
+        val autoBuckets = LinkedHashMap<String, Pair<String, MutableList<PhoneFileItem>>>()
+        for (file in unmatchedFiles) {
+            val (autoTitle, autoDescription) = inferAutomaticGroupTitleAndDescription(file)
+            val pair = autoBuckets.getOrPut(autoTitle) {
+                autoDescription to mutableListOf()
+            }
+            pair.second.add(file)
+        }
+
+        for ((autoTitle, descAndFiles) in autoBuckets) {
+            val groupFiles = descAndFiles.second
+            if (groupFiles.isNotEmpty()) {
+                finalGroups.add(
+                    DynamicLensGroup(
+                        id = "auto_${autoTitle.lowercase(Locale.ROOT)}",
+                        title = autoTitle,
+                        description = descAndFiles.first,
+                        files = groupFiles,
+                        totalBytes = groupFiles.sumOf { it.sizeBytes },
+                        isUserPreset = false
+                    )
+                )
+            }
+        }
+
+        return finalGroups
+    }
+
+    private fun buildCompiledPresets(presetLabels: List<String>): List<CompiledPreset> {
+        return presetLabels
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinctBy { it.lowercase(Locale.ROOT) }
+            .map { label ->
+                val expanded = expandPresetLabelKeywords(label).filter { it.length >= 3 }
+                val tokens = tokenizeWords(label)
+                val embedding = computeSemanticEmbedding("$label ${expanded.joinToString(" ")}")
+                CompiledPreset(
+                    label = label,
+                    labelTokens = tokens,
+                    expandedKeywords = expanded,
+                    embedding = embedding
+                )
+            }
+    }
+
+    private fun resolveLensTagWithCompiledPresets(
+        file: PhoneFileItem,
+        compiledPresets: List<CompiledPreset>
+    ): String {
+        val matchedPreset = matchFileToCompiledPresets(file, compiledPresets)
+        if (matchedPreset != null) return matchedPreset
+        return inferAutomaticGroupTitleAndDescription(file).first
+    }
+
+    /**
+     * Fast O(1) per-preset check using pre-compiled keywords and cached embeddings (no disk I/O).
+     */
+    private fun matchFileToCompiledPresets(
+        file: PhoneFileItem,
+        compiledPresets: List<CompiledPreset>
+    ): String? {
+        if (compiledPresets.isEmpty()) return null
+
+        val fileNameLower = file.name.lowercase(Locale.ROOT)
+        val pathLower = file.fullPath.lowercase(Locale.ROOT)
+        val cachedChunks = fileChunkStore[file.id]
+        val contentText = buildString {
+            append(fileNameLower).append(' ').append(pathLower)
+            if (cachedChunks != null && cachedChunks.isNotEmpty()) {
+                append(' ')
+                cachedChunks.forEach { append(it.text.lowercase(Locale.ROOT)).append(' ') }
+            } else {
+                append(' ').append(extractFileTextContent(file, allowDiskRead = false).lowercase(Locale.ROOT))
+            }
+        }
+        val cachedEmbedding = cachedChunks?.firstOrNull()?.embedding
+
+        var bestLabel: String? = null
+        var bestScore = 0f
+
+        for (preset in compiledPresets) {
+            var score = 0f
+            // Direct phrase or token match in filename/path (high confidence)
+            if (preset.labelTokens.isNotEmpty() &&
+                preset.labelTokens.all { fileNameLower.contains(it) || pathLower.contains(it) }
+            ) {
+                score += 0.75f
+            }
+
+            // Expanded domain synonym hits in filename, path, and semantic summary
+            var keywordHits = 0
+            for (kw in preset.expandedKeywords) {
+                if (contentText.contains(kw)) {
+                    keywordHits++
+                    if (keywordHits >= 4) break
+                }
+            }
+            if (keywordHits > 0) {
+                score += (keywordHits * 0.22f).coerceAtMost(0.75f)
+            }
+
+            // Use cached vector cosine similarity when available
+            if (cachedEmbedding != null) {
+                val cosine = cosineSimilarity(preset.embedding, cachedEmbedding)
+                if (cosine >= 0.42f) {
+                    score += cosine * 0.45f
+                }
+            }
+
+            if (score > bestScore && score >= 0.40f) {
+                bestScore = score
+                bestLabel = preset.label
+            }
+        }
+
+        return bestLabel
+    }
+
+    private fun expandPresetLabelKeywords(label: String): Set<String> {
+        val lower = label.lowercase(Locale.ROOT)
+        val baseWords = tokenizeWords(lower).toMutableSet()
+
+        if (lower.contains("blood") || lower.contains("lab") || lower.contains("medical") ||
+            lower.contains("health") || lower.contains("pathology") || lower.contains("doctor") ||
+            lower.contains("hospital") || lower.contains("clinic") || lower.contains("test")
+        ) {
+            baseWords.addAll(
+                listOf(
+                    "blood", "cbc", "lipid", "pathology", "hemoglobin", "platelet", "cholesterol",
+                    "triglyceride", "hba1c", "glucose", "medical", "health", "clinical", "diagnostic",
+                    "laboratory", "hematology", "insurance", "patient", "physician"
+                )
+            )
+        }
+
+        if (lower.contains("bank") || lower.contains("statement") || lower.contains("account") ||
+            lower.contains("finance") || lower.contains("financial") || lower.contains("record") ||
+            lower.contains("audit") || lower.contains("ledger")
+        ) {
+            baseWords.addAll(
+                listOf(
+                    "bank", "statement", "checking", "savings", "wire", "deposit", "balance",
+                    "financial", "audit", "ledger", "reconciliation", "transaction", "account"
+                )
+            )
+        }
+
+        if (lower.contains("tax") || lower.contains("invoice") || lower.contains("receipt") ||
+            lower.contains("bill") || lower.contains("gst") || lower.contains("expense")
+        ) {
+            baseWords.addAll(
+                listOf(
+                    "tax", "federal", "property", "return", "transcript", "assessment",
+                    "invoice", "receipt", "billing", "payment", "deduction", "withholding", "renewal"
+                )
+            )
+        }
+
+        if (lower.contains("travel") || lower.contains("flight") || lower.contains("boarding") ||
+            lower.contains("trip") || lower.contains("ticket") || lower.contains("hotel") ||
+            lower.contains("passport") || lower.contains("visa")
+        ) {
+            baseWords.addAll(
+                listOf(
+                    "travel", "flight", "boarding", "itinerary", "airline", "tokyo", "kyoto",
+                    "ryokan", "rail", "train", "passport", "visa", "booking", "ticket"
+                )
+            )
+        }
+
+        if (lower.contains("lease") || lower.contains("rent") || lower.contains("property") ||
+            lower.contains("contract") || lower.contains("agreement")
+        ) {
+            baseWords.addAll(
+                listOf("lease", "apartment", "rent", "agreement", "signed", "contract", "proposal", "tenancy")
+            )
+        }
+
+        if (lower.contains("book") || lower.contains("manual") || lower.contains("engineering") ||
+            lower.contains("study") || lower.contains("research")
+        ) {
+            baseWords.addAll(
+                listOf(
+                    "book", "handbook", "manual", "guide", "schematic", "research", "paper",
+                    "kernel", "coroutines", "architecture", "inverter", "calibration"
+                )
+            )
+        }
+
+        return baseWords
+    }
+
+    /**
+     * Automatically groups and names files that did not match any user Pre-Set Lens label.
+     */
+    private fun inferAutomaticGroupTitleAndDescription(file: PhoneFileItem): Pair<String, String> {
+        val text = (file.name + " " + file.fullPath).lowercase(Locale.ROOT)
+        return when {
+            text.contains("blood") || text.contains("pathology") || text.contains("medical") ||
+                text.contains("health") || text.contains("insurance") ->
+                "Auto: Medical & Health Records" to "Automatically grouped by AI from clinical, lab, and health policy terms"
+
+            text.contains("bank") || text.contains("statement") || text.contains("audit") ||
+                text.contains("ledger") ->
+                "Auto: Banking & Financial Ledgers" to "Automatically grouped by AI from account statements and financial audits"
+
+            text.contains("invoice") || text.contains("tax") || text.contains("receipt") ||
+                text.contains("lease") ->
+                "Auto: Invoices, Tax & Contracts" to "Automatically grouped by AI from billing receipts, tax filings, and agreements"
+
+            text.contains("travel") || text.contains("flight") || text.contains("boarding") ||
+                text.contains("rail") || text.contains("kyoto") || text.contains("passport") ->
+                "Auto: Travel & Identification" to "Automatically grouped by AI from itineraries, passes, and ID scans"
+
+            text.contains("book") || text.contains("manual") || text.contains("guide") ||
+                text.contains("schematic") || text.contains("research") || text.contains("kernel") ||
+                text.contains("coroutines") || text.contains("architecture") || text.contains("okr") ||
+                text.contains("proposal") || text.contains("roadmap") ->
+                "Auto: Engineering, Books & Specs" to "Automatically grouped by AI from technical manuals, books, and architecture docs"
+
+            file.category == FileCategory.IMAGE ->
+                "Auto: Photos, RAWs & Screenshots" to "Automatically grouped by AI from camera captures, landscapes, and UI screenshots"
+
+            file.category == FileCategory.VIDEO ->
+                "Auto: Videos & Drone Footage" to "Automatically grouped by AI from 4K drone clips, rehearsals, and recordings"
+
+            file.category == FileCategory.AUDIO ->
+                "Auto: Audio, Voice Notes & Podcasts" to "Automatically grouped by AI from studio masters, voice notes, and podcasts"
+
+            else ->
+                "Auto: Archives, APKs & System Configs" to "Automatically grouped by AI from compressed bundles, packages, and logs"
+        }
     }
 
     /**
@@ -273,7 +538,7 @@ class OnDeviceAiEngine(private val context: Context) {
         appliedMap: Map<String, String>
     ): List<RenameSuggestion> {
         val monthFormat = SimpleDateFormat("yyyy_MMM", Locale.US)
-        val candidates = files.filter { file ->
+        val candidates = files.asSequence().filter { file ->
             val n = file.name.lowercase(Locale.ROOT)
             n.startsWith("img_") ||
                 n.startsWith("dsc_") ||
@@ -284,7 +549,7 @@ class OnDeviceAiEngine(private val context: Context) {
                 n.contains("q1_") ||
                 n.contains("monthly_") ||
                 n.contains("cloud_")
-        }.ifEmpty { files.take(10) }
+        }.take(40).toList().ifEmpty { files.take(10) }
 
         return candidates.map { file ->
             val datePrefix = monthFormat.format(Date(file.modifiedAtMillis))
@@ -344,7 +609,7 @@ class OnDeviceAiEngine(private val context: Context) {
                 )
                 else -> {
                     val cleanStem = file.name.substringBeforeLast('.')
-                        .replace(Regex("^(IMG|DSC|VID|Screenshot)_\\d+_?"), "")
+                        .replace(GENERIC_PREFIX_REGEX, "")
                         .ifBlank { "Indexed_Document" }
                     Triple(
                         "${datePrefix}_${cleanStem}",
@@ -375,7 +640,7 @@ class OnDeviceAiEngine(private val context: Context) {
     ): List<JunkCandidate> {
         val candidates = mutableListOf<JunkCandidate>()
 
-        for (file in files) {
+        for (file in files.take(250)) {
             val lower = file.name.lowercase(Locale.ROOT)
             when {
                 lower.contains("dsc_0849") -> {
@@ -431,7 +696,8 @@ class OnDeviceAiEngine(private val context: Context) {
 
         // If user has custom phone images/videos, also check for same-size or burst-named files
         if (candidates.size < 4) {
-            files.filter { it.category == FileCategory.IMAGE }
+            files.asSequence()
+                .filter { it.category == FileCategory.IMAGE }
                 .drop(2)
                 .take(2)
                 .forEach { img ->
@@ -485,7 +751,7 @@ class OnDeviceAiEngine(private val context: Context) {
             else -> null
         }
 
-        val minSizeMb: Int? = Regex("(\\d+)\\s*mb").find(lower)?.groupValues?.getOrNull(1)?.toIntOrNull()
+        val minSizeMb: Int? = MB_SIZE_REGEX.find(lower)?.groupValues?.getOrNull(1)?.toIntOrNull()
 
         val matched = files.filter { file ->
             val catMatch = filterCategory == null || file.category == filterCategory
@@ -567,7 +833,7 @@ class OnDeviceAiEngine(private val context: Context) {
             qLower.contains("summary") || qLower.contains("summarize") || qLower.contains("what is this") -> {
                 "On-Device RAG Summary for ${file.name}:\n" +
                     "• Document Type: ${file.category.displayName} (${file.formattedSize()} on ${file.storageLocation.displayName})\n" +
-                    "• Key Content: ${topChunks.firstOrNull()?.text ?: extractFileTextContent(file)}\n" +
+                    "• Key Content: ${topChunks.firstOrNull()?.text ?: extractFileTextContent(file, allowDiskRead = false)}\n" +
                     "• Indexed across ${chunks.size} sentence-boundary chunk(s) (~${chunks.sumOf { it.estimatedTokens }} tokens)."
             }
             qLower.contains("size") || qLower.contains("where") || qLower.contains("path") || qLower.contains("location") -> {
@@ -584,7 +850,7 @@ class OnDeviceAiEngine(private val context: Context) {
                     "• Relevant Passage: \"$contextText\""
             }
             else -> {
-                val bestPassage = topChunks.firstOrNull()?.text ?: extractFileTextContent(file)
+                val bestPassage = topChunks.firstOrNull()?.text ?: extractFileTextContent(file, allowDiskRead = false)
                 "Based on local RAG retrieval over ${file.name} (Chunk #${(topChunks.firstOrNull()?.chunkIndex ?: 0) + 1} of ${chunks.size}):\n\n" +
                     "\"$bestPassage\""
             }
@@ -602,16 +868,25 @@ class OnDeviceAiEngine(private val context: Context) {
         )
     }
 
-    private fun extractFileTextContent(file: PhoneFileItem): String {
-        // 1. Try reading real text if it's a readable text/markdown/csv/json/log file on disk
-        val diskFile = File(file.fullPath)
-        if (diskFile.exists() && diskFile.canRead() && diskFile.length() in 16L..128_000L) {
+    private fun extractFileTextContent(
+        file: PhoneFileItem,
+        allowDiskRead: Boolean = false
+    ): String {
+        // 1. Only read from disk when explicitly indexing a single file on a background thread, capped at 2 KB
+        if (allowDiskRead) {
             val ext = file.extension.lowercase(Locale.ROOT)
-            if (ext in setOf("txt", "md", "csv", "json", "xml", "log", "ini", "yaml", "yml")) {
+            if (ext in TEXT_FILE_EXTENSIONS && file.sizeBytes in 16L..64_000L) {
                 try {
-                    val raw = diskFile.readText()
-                    if (raw.length > 20 && !raw.startsWith("FILE_RADAR_INDEXED_HEADER")) {
-                        return "${file.name} located at ${file.fullPath}. $raw"
+                    val diskFile = File(file.fullPath)
+                    if (diskFile.exists() && diskFile.canRead()) {
+                        val snippet = diskFile.bufferedReader().use { reader ->
+                            val buf = CharArray(2048)
+                            val count = reader.read(buf)
+                            if (count > 0) String(buf, 0, count) else ""
+                        }
+                        if (snippet.length > 20 && !snippet.startsWith("FILE_RADAR_INDEXED_HEADER")) {
+                            return "${file.name} located at ${file.fullPath}. $snippet"
+                        }
                     }
                 } catch (_: Throwable) {
                     // Fallback to rich semantic descriptor below
@@ -624,12 +899,14 @@ class OnDeviceAiEngine(private val context: Context) {
         val baseMeta = "File ${file.name} (${file.category.displayName}, ${file.formattedSize()}) stored on ${file.storageLocation.displayName} at ${file.fullPath}."
 
         val specificContext = when {
+            lower.contains("blood_report") || lower.contains("blood_test") || lower.contains("pathology") ->
+                "Complete Blood Count (CBC) and Lipid Panel diagnostic pathology blood report. Hemoglobin 14.8 g/dL, WBC 6.2 x10^3/uL, Platelets 245,000, Fasting Glucose 89 mg/dL, HbA1c 5.2%, Total Cholesterol 176 mg/dL, HDL 58 mg/dL, LDL 98 mg/dL, Triglycerides 102 mg/dL. Clinical laboratory hematology results within normal reference range."
             lower.contains("q4_financial_audit") ->
                 "Quarterly Financial Audit Report for Q4 2026. Covers balance sheet reconciliation, operating expenses, hardware procurement receipts, monitor and workstation equipment depreciation, and tax compliance sign-off."
             lower.contains("bank_statement") ->
                 "Monthly bank account statement detailing wire transfers, direct deposits, utility bill payments, software subscription receipts, and ending checking balance."
             lower.contains("health_insurance") ->
-                "Annual health insurance policy coverage summary, medical deductible schedule, prescription benefits, and in-network hospital directory."
+                "Annual health insurance policy coverage summary, medical deductible schedule, prescription benefits, pathology blood report reimbursement, and in-network hospital directory."
             lower.contains("flight_itinerary") || lower.contains("boarding_pass") ->
                 "International flight itinerary and airline boarding pass from San Francisco (SFO) to Tokyo Haneda (HND). Includes seat assignment 14A, baggage allowance, gate terminal info, and e-ticket receipt."
             lower.contains("apartment_lease") ->
@@ -699,29 +976,9 @@ class OnDeviceAiEngine(private val context: Context) {
         val lower = text.lowercase(Locale.ROOT)
         val words = tokenizeWords(lower)
 
-        // Semantic concept cluster dimensions (0..15)
-        val conceptClusters = arrayOf(
-            setOf("invoice", "receipt", "bill", "payment", "cost", "price", "statement", "bank", "audit", "financial", "ledger", "expense", "monitor", "cloud", "hosting"),
-            setOf("tax", "federal", "property", "return", "transcript", "irs", "assessment", "deduction", "lease", "insurance", "policy"),
-            setOf("travel", "flight", "boarding", "pass", "tokyo", "japan", "kyoto", "hotel", "ryokan", "rail", "train", "itinerary", "passport", "visa", "trip", "airport"),
-            setOf("photo", "image", "picture", "sunset", "beach", "coast", "coastal", "ocean", "sea", "bridge", "goldengate", "outdoor", "landscape", "panorama", "fjord", "scenic"),
-            setOf("night", "sky", "star", "milkyway", "aurora", "astrophotography", "raw", "dng", "exposure", "camera", "lens"),
-            setOf("video", "clip", "movie", "drone", "flyover", "alps", "glacier", "mountain", "4k", "hdr", "footage", "keynote", "demo", "rehearsal"),
-            setOf("audio", "music", "song", "podcast", "voice", "note", "recording", "meeting", "symphony", "flac", "rainforest", "thunder", "sound"),
-            setOf("book", "handbook", "textbook", "manual", "guide", "reference", "architecture", "clean", "kotlin", "coroutines", "linux", "kernel", "distributed", "system"),
-            setOf("hardware", "schematic", "pcb", "keyboard", "sensor", "optical", "solar", "inverter", "battery", "thermal", "calibration", "firmware"),
-            setOf("ai", "ml", "npu", "transformer", "attention", "quantization", "gemma", "model", "research", "paper", "survey", "vector"),
-            setOf("screenshot", "screen", "monitor", "terminal", "cpu", "memory", "ram", "graph", "benchmark", "latency", "ui"),
-            setOf("work", "roadmap", "proposal", "okr", "presentation", "strategy", "consulting", "project", "client", "report"),
-            setOf("backup", "archive", "zip", "tar", "snapshot", "dotfiles", "source", "legacy", "compressed", "bundle"),
-            setOf("apk", "android", "app", "package", "sdk", "platform", "tools", "maps", "analyzer", "network"),
-            setOf("config", "json", "log", "trace", "wireguard", "routing", "mesh", "csv", "dataset", "telemetry"),
-            setOf("pdf", "document", "doc", "docx", "xlsx", "spreadsheet", "markdown", "changelog", "release")
-        )
-
         for (w in words) {
-            for (clusterIdx in conceptClusters.indices) {
-                if (conceptClusters[clusterIdx].any { kw -> w.startsWith(kw) || kw.startsWith(w) }) {
+            for (clusterIdx in CONCEPT_CLUSTERS.indices) {
+                if (CONCEPT_CLUSTERS[clusterIdx].any { kw -> w.startsWith(kw) || kw.startsWith(w) }) {
                     vec[clusterIdx] += 2.4f
                 }
             }
@@ -731,8 +988,8 @@ class OnDeviceAiEngine(private val context: Context) {
             vec[bucket] += 1.2f
         }
 
-        // Character 3-gram projection into dimensions 48..63 for typo/substring resilience
-        val cleanAlpha = lower.replace(Regex("[^a-z0-9]"), "")
+        // Character 3-gram projection into dimensions 48..63 (capped at first 180 chars for speed)
+        val cleanAlpha = NON_ALPHANUM_REGEX.replace(lower.take(220), "")
         for (i in 0 until (cleanAlpha.length - 2).coerceAtLeast(0)) {
             val trigram = cleanAlpha.substring(i, i + 3)
             val bucket = 48 + (abs(trigram.hashCode()) % 16)
@@ -761,8 +1018,37 @@ class OnDeviceAiEngine(private val context: Context) {
     }
 
     private fun tokenizeWords(text: String): List<String> {
-        return text.lowercase(Locale.ROOT)
-            .split(Regex("[^a-z0-9]+"))
+        return WORD_SPLIT_REGEX.split(text.lowercase(Locale.ROOT))
             .filter { it.length >= 2 }
+    }
+
+    companion object {
+        private val WORD_SPLIT_REGEX = Regex("[^a-z0-9]+")
+        private val NON_ALPHANUM_REGEX = Regex("[^a-z0-9]")
+        private val GENERIC_PREFIX_REGEX = Regex("^(IMG|DSC|VID|Screenshot)_\\d+_?")
+        private val MB_SIZE_REGEX = Regex("(\\d+)\\s*mb")
+
+        private val TEXT_FILE_EXTENSIONS = setOf(
+            "txt", "md", "csv", "json", "xml", "log", "ini", "yaml", "yml"
+        )
+
+        private val CONCEPT_CLUSTERS = arrayOf(
+            setOf("invoice", "receipt", "bill", "payment", "cost", "price", "statement", "bank", "audit", "financial", "ledger", "expense", "monitor", "cloud", "hosting"),
+            setOf("tax", "federal", "property", "return", "transcript", "irs", "assessment", "deduction", "lease", "insurance", "policy"),
+            setOf("travel", "flight", "boarding", "pass", "tokyo", "japan", "kyoto", "hotel", "ryokan", "rail", "train", "itinerary", "passport", "visa", "trip", "airport"),
+            setOf("photo", "image", "picture", "sunset", "beach", "coast", "coastal", "ocean", "sea", "bridge", "goldengate", "outdoor", "landscape", "panorama", "fjord", "scenic"),
+            setOf("night", "sky", "star", "milkyway", "aurora", "astrophotography", "raw", "dng", "exposure", "camera", "lens"),
+            setOf("video", "clip", "movie", "drone", "flyover", "alps", "glacier", "mountain", "4k", "hdr", "footage", "keynote", "demo", "rehearsal"),
+            setOf("audio", "music", "song", "podcast", "voice", "note", "recording", "meeting", "symphony", "flac", "rainforest", "thunder", "sound"),
+            setOf("book", "handbook", "textbook", "manual", "guide", "reference", "architecture", "clean", "kotlin", "coroutines", "linux", "kernel", "distributed", "system"),
+            setOf("hardware", "schematic", "pcb", "keyboard", "sensor", "optical", "solar", "inverter", "battery", "thermal", "calibration", "firmware"),
+            setOf("ai", "ml", "npu", "transformer", "attention", "quantization", "gemma", "model", "research", "paper", "survey", "vector"),
+            setOf("screenshot", "screen", "monitor", "terminal", "cpu", "memory", "ram", "graph", "benchmark", "latency", "ui"),
+            setOf("work", "roadmap", "proposal", "okr", "presentation", "strategy", "consulting", "project", "client", "report"),
+            setOf("backup", "archive", "zip", "tar", "snapshot", "dotfiles", "source", "legacy", "compressed", "bundle"),
+            setOf("apk", "android", "app", "package", "sdk", "platform", "tools", "maps", "analyzer", "network"),
+            setOf("config", "json", "log", "trace", "wireguard", "routing", "mesh", "csv", "dataset", "telemetry"),
+            setOf("blood", "pathology", "cbc", "lipid", "hemoglobin", "platelet", "cholesterol", "hba1c", "glucose", "medical", "health", "clinical", "lab", "hospital", "pdf", "document")
+        )
     }
 }
