@@ -119,7 +119,9 @@ data class PhoneFileItem(
     val storageLocation: StorageLocation,
     val volumeLabel: String,
     val category: FileCategory,
-    val mimeType: String
+    val mimeType: String,
+    val contentUri: String? = null,
+    val isSampleFile: Boolean = false
 ) {
     fun formattedSize(): String = FileFormatters.formatFileSize(sizeBytes)
     fun formattedExactBytes(): String = FileFormatters.formatExactBytes(sizeBytes)

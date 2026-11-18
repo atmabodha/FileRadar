@@ -71,6 +71,32 @@ All AI capabilities live in the dedicated **AI Search** tab while keeping the **
 
 ---
 
+## Phone System Requirements & Hardware Target
+
+| Component | Minimum Requirement (Standard Mode) | Recommended Target (On-Device AI Mode) |
+| :--- | :--- | :--- |
+| **Android OS Version** | **Android 7.0 Nougat (`API 24`)** or higher | **Android 11 (`API 30`) – Android 16 (`API 36`)** |
+| **Physical RAM** | **4 GB RAM** (with Master AI Kill Switch disabled or lightweight search) | **8 GB+ Physical LPDDR5/LPDDR4X RAM** (without relying on slower virtual RAM / RAM Boost) |
+| **Processor (SoC)** | 64-bit ARM (`arm64-v8a`) multi-core CPU | Mid-range to flagship 64-bit SoC with dedicated GPU / NPU acceleration |
+| **Free Internal Storage** | **~50 MB** for app installation, thumbnail cache & PDF render cache | **~1.5 GB – 2.0 GB** free internal storage (to accommodate the ~1.3 GB 4-bit quantized Gemma E2B `.bin` weights and vector index) |
+| **Battery & Thermal State** | Any battery level | Battery **> 20%** (`requiresBatteryNotLow`) for incremental indexing; **Charging** (`requiresCharging`) recommended for initial backlog indexing |
+| **External Storage Support** | Internal Shared Storage (`/storage/emulated/0`) | Internal Shared Storage + Removable microSD / USB OTG volumes (`StorageManager`) |
+
+### Why 8 GB Physical RAM is Recommended for On-Device Generative AI
+- **Model Memory Footprint**: Loading the 4-bit quantized **Gemma E2B (~1.3 GB)** model weights via the MediaPipe LLM Inference runtime alongside the Android OS and UI requires roughly **1.5 GB – 2.0 GB** of contiguous physical memory.
+- **No Virtual Swap Lag**: Running inference in physical RAM avoids swapping weights to slower flash-backed virtual RAM (RAM Boost / zRAM), preventing UI stutters and thermal throttling.
+- **Automatic RAM Flush & Kill Switch for Lower-RAM Phones**:
+  - The inference engine runs on background I/O threads and is **flushed from RAM immediately** after an indexing or Q&A queue completes.
+  - On phones with **4 GB – 6 GB of RAM** (or when saving battery), users can turn off the **Master AI Toggle (Kill Switch)** in **Settings** to disable all background AI processing and use the fast **Standard** file finder and in-app PDF/media viewers with minimal memory overhead.
+
+### Required & Optional Android Permissions
+- **All Files Access (`MANAGE_EXTERNAL_STORAGE` on Android 11+ / API 30+)**:
+  - Recommended so the scanner can discover non-media files (such as PDFs, Office documents, archives, APKs, and config files) across all folders in `/storage/emulated/0/` and removable SD cards.
+- **Scoped Storage & `MediaStore` Fallback**:
+  - Even before All Files Access is granted, File Radar queries `MediaStore` (`Files`, `Downloads`, `Images`, `Video`, `Audio`) and opens discovered files via `ContentResolver` `content://` URIs.
+
+---
+
 ## Project Architecture
 
 ```text

@@ -1,6 +1,7 @@
 package com.example.data
 
 import android.content.ContentResolver
+import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -129,7 +130,12 @@ class PhoneFileScannerRepository(private val context: Context) {
             sdVolumeLabel = detectedSdVolumeName
         )
         for (item in mediaStoreItems) {
-            discoveredByPath.putIfAbsent(item.fullPath, item)
+            val existing = discoveredByPath[item.fullPath]
+            if (existing == null) {
+                discoveredByPath[item.fullPath] = item
+            } else if (existing.contentUri == null && item.contentUri != null) {
+                discoveredByPath[item.fullPath] = existing.copy(contentUri = item.contentUri)
+            }
         }
 
         // 4. Scan any user-authorized SAF Document Trees
@@ -140,7 +146,12 @@ class PhoneFileScannerRepository(private val context: Context) {
                 sdVolumeLabel = detectedSdVolumeName
             )
             for (item in safItems) {
-                discoveredByPath.putIfAbsent(item.fullPath, item)
+                val existing = discoveredByPath[item.fullPath]
+                if (existing == null) {
+                    discoveredByPath[item.fullPath] = item
+                } else if (existing.contentUri == null && item.contentUri != null) {
+                    discoveredByPath[item.fullPath] = existing.copy(contentUri = item.contentUri)
+                }
             }
         }
 
@@ -345,6 +356,12 @@ class PhoneFileScannerRepository(private val context: Context) {
                             .getMimeTypeFromExtension(ext.lowercase(Locale.ROOT))
                             ?: "application/octet-stream"
 
+                        val docUriStr = try {
+                            DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)?.toString()
+                        } catch (_: Throwable) {
+                            null
+                        }
+
                         results.add(
                             PhoneFileItem(
                                 id = fullPath,
@@ -357,7 +374,9 @@ class PhoneFileScannerRepository(private val context: Context) {
                                 storageLocation = storageLoc,
                                 volumeLabel = volumeLabel,
                                 category = FileCategory.fromExtension(ext, resolvedMime),
-                                mimeType = resolvedMime
+                                mimeType = resolvedMime,
+                                contentUri = docUriStr,
+                                isSampleFile = false
                             )
                         )
                     }
@@ -475,6 +494,7 @@ class PhoneFileScannerRepository(private val context: Context) {
                         null,
                         "${MediaStore.Files.FileColumns.DATE_MODIFIED} DESC"
                     )?.use { cursor ->
+                        val idIdx = cursor.getColumnIndex(MediaStore.Files.FileColumns._ID)
                         val nameIdx = cursor.getColumnIndex(MediaStore.Files.FileColumns.DISPLAY_NAME)
                         val sizeIdx = cursor.getColumnIndex(MediaStore.Files.FileColumns.SIZE)
                         val addedIdx = cursor.getColumnIndex(MediaStore.Files.FileColumns.DATE_ADDED)
@@ -496,6 +516,15 @@ class PhoneFileScannerRepository(private val context: Context) {
                             val mime = if (mimeIdx >= 0) cursor.getString(mimeIdx) else null
                             val ext = resolveExtension(displayName, mime)
                             if (ext.isEmpty()) continue
+
+                            val rowId = if (idIdx >= 0 && !cursor.isNull(idIdx)) cursor.getLong(idIdx) else -1L
+                            val rowContentUri = if (rowId >= 0L) {
+                                try {
+                                    ContentUris.withAppendedId(uri, rowId).toString()
+                                } catch (_: Throwable) {
+                                    null
+                                }
+                            } else null
 
                             val addedSec = if (addedIdx >= 0) cursor.getLong(addedIdx) else 0L
                             val modSec = if (modIdx >= 0) cursor.getLong(modIdx) else 0L
@@ -528,7 +557,9 @@ class PhoneFileScannerRepository(private val context: Context) {
                                 storageLocation = storageLoc,
                                 volumeLabel = volumeLabel,
                                 category = FileCategory.fromExtension(ext, resolvedMime),
-                                mimeType = resolvedMime
+                                mimeType = resolvedMime,
+                                contentUri = rowContentUri,
+                                isSampleFile = false
                             )
                         }
                     }
@@ -649,7 +680,9 @@ class PhoneFileScannerRepository(private val context: Context) {
                     storageLocation = spec.storageLocation,
                     volumeLabel = spec.volumeLabel,
                     category = FileCategory.fromExtension(ext, spec.mimeType),
-                    mimeType = spec.mimeType
+                    mimeType = spec.mimeType,
+                    contentUri = null,
+                    isSampleFile = true
                 )
             )
         }

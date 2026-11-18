@@ -138,22 +138,31 @@ fun FileFinderScreen(
     val shareFileWithApps: (PhoneFileItem) -> Unit = { fileItem ->
         try {
             val realFile = File(fileItem.fullPath)
-            val fileToShare = if (realFile.exists() && realFile.canRead()) {
-                realFile
-            } else {
-                val shareStagingDir = File(context.cacheDir, "shared_files").apply { mkdirs() }
-                File(shareStagingDir, fileItem.name).apply {
-                    if (!exists()) {
-                        writeText("File: ${fileItem.name}\nPath: ${fileItem.fullPath}\nSize: ${fileItem.formattedSize()}\n")
+            val contentUri = when {
+                realFile.exists() && realFile.canRead() -> {
+                    FileProvider.getUriForFile(
+                        context,
+                        "${context.packageName}.fileprovider",
+                        realFile
+                    )
+                }
+                !fileItem.contentUri.isNullOrBlank() -> {
+                    Uri.parse(fileItem.contentUri)
+                }
+                else -> {
+                    val shareStagingDir = File(context.cacheDir, "shared_files").apply { mkdirs() }
+                    val stagedFile = File(shareStagingDir, fileItem.name).apply {
+                        if (!exists()) {
+                            writeText("File: ${fileItem.name}\nPath: ${fileItem.fullPath}\nSize: ${fileItem.formattedSize()}\n")
+                        }
                     }
+                    FileProvider.getUriForFile(
+                        context,
+                        "${context.packageName}.fileprovider",
+                        stagedFile
+                    )
                 }
             }
-
-            val contentUri = FileProvider.getUriForFile(
-                context,
-                "${context.packageName}.fileprovider",
-                fileToShare
-            )
             val resolvedMime = fileItem.mimeType.ifBlank { "*/*" }
 
             val shareIntent = Intent(Intent.ACTION_SEND).apply {
