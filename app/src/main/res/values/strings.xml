@@ -1,0 +1,26 @@
+<resources>
+    <string name="app_name">File Radar</string>
+    <string name="app_subtitle">READ-ONLY STORAGE INDEXER</string>
+    <string name="search_placeholder">Filter found files by name or path…</string>
+    <string name="clear_search">Clear search query</string>
+    <string name="rescan_storage">Rescan phone storage</string>
+    <string name="label_file_type">FILE TYPE</string>
+    <string name="label_storage_location">STORAGE LOCATION</string>
+    <string name="label_sort_by">SORT BY</string>
+    <string name="sort_direction_asc">Ascending</string>
+    <string name="sort_direction_desc">Descending</string>
+    <string name="toggle_sort_order">Toggle sort direction</string>
+    <string name="copy_path_action">Copy full path</string>
+    <string name="share_file_action">Share file</string>
+    <string name="path_copied_toast">Full path copied to clipboard</string>
+    <string name="read_only_badge">Read-Only • No Browse or Delete</string>
+    <string name="empty_results_title">No matching files found</string>
+    <string name="empty_results_subtitle">Try changing the selected file type dropdown, switching storage locations, or clearing your search text.</string>
+    <string name="reset_filters_button">Reset All Filters</string>
+    <string name="label_full_path">FULL PATH ON PHONE</string>
+    <string name="label_created">Created</string>
+    <string name="label_modified">Modified</string>
+    <string name="label_size">Size</string>
+    <string name="file_inspector_title">File Metadata Inspector</string>
+    <string name="close_inspector">Close details</string>
+</resources>
