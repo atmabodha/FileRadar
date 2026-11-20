@@ -260,5 +260,99 @@ class ExampleRobolectricTest {
         assertTrue(summaryAnswer.text.contains("14.8 g/dL") || summaryAnswer.text.contains("89 mg/dL"))
         assertTrue(summaryAnswer.pageCitations.isNotEmpty())
     }
+
+    @Test
+    fun `cross-page running header stripping, section inheritance, and multi-turn conversational memory work accurately`() {
+        val samplePdf = PhoneFileItem(
+            id = "pdf_test_advanced_rag",
+            name = "Apex_Hospital_Panel_2026.pdf",
+            fullPath = "/storage/emulated/0/Documents/Apex_Hospital_Panel_2026.pdf",
+            extension = "pdf",
+            mimeType = "application/pdf",
+            sizeBytes = 640_000L,
+            createdAtMillis = 1_760_000_000_000L,
+            modifiedAtMillis = 1_760_000_000_000L,
+            category = FileCategory.PDF,
+            storageLocation = StorageLocation.INTERNAL,
+            volumeLabel = "Internal Shared",
+            isSampleFile = true
+        )
+
+        val rawPages = listOf(
+            """
+                Apex Clinical Diagnostics Center - Confidential Report
+                1. HEMATOLOGY PANEL
+                Hemoglobin | 14.8 g/dL | 13.2 - 16.6 g/dL
+                White Blood Cell Count | 6.4 x10^3/uL | 4.5 - 11.0 x10^3/uL
+                Page 1 of 3
+            """.trimIndent(),
+            """
+                Apex Clinical Diagnostics Center - Confidential Report
+                2. LIPID METABOLIC PANEL
+                Total Cholesterol | 176 mg/dL | < 200 mg/dL
+                LDL Cholesterol | 98 mg/dL | < 100 mg/dL
+                Page 2 of 3
+            """.trimIndent(),
+            """
+                Apex Clinical Diagnostics Center - Confidential Report
+                3. THYROID & VITAMIN PANEL
+                TSH (Thyroid Stimulating Hormone) | 1.84 mIU/L | 0.45 - 4.50 mIU/L
+                Vitamin D 25-Hydroxy | 41 ng/mL | 30 - 100 ng/mL
+                Page 3 of 3
+            """.trimIndent()
+        ).mapIndexed { index, raw ->
+            com.example.pdfextractor.model.ExtractedPage(
+                pageNumber = index + 1,
+                rawText = raw,
+                normalizedText = com.example.pdfextractor.TextNormalizer.normalize(raw),
+                source = com.example.pdfextractor.model.ExtractionSource.ML_KIT_OCR
+            )
+        }
+
+        // Verify cross-page running header ("Apex Clinical Diagnostics Center - Confidential Report") is stripped
+        val (cleanedPages, removedCount) = com.example.pdfextractor.TextNormalizer.stripCrossPageRunningHeadersAndFooters(rawPages)
+        assertTrue(removedCount >= 3)
+        assertFalse(cleanedPages[0].normalizedText.contains("Apex Clinical Diagnostics Center"))
+        assertTrue(cleanedPages[0].detectedSections.any { it.contains("HEMATOLOGY PANEL") })
+
+        val docUri = android.net.Uri.parse("file:///storage/emulated/0/Documents/Apex_Hospital_Panel_2026.pdf")
+        val chunks = com.example.pdfextractor.TextChunker.chunkPages(docUri, cleanedPages)
+        assertTrue(chunks.any { it.sectionHeading?.contains("HEMATOLOGY PANEL") == true })
+
+        val extraction = com.example.pdfextractor.model.DocumentExtractionResult(
+            documentUri = docUri,
+            totalPages = cleanedPages.size,
+            pages = cleanedPages,
+            chunks = chunks,
+            removedRunningHeadersCount = removedCount
+        )
+
+        // Turn 1: Ask about Hemoglobin
+        val turn1User = com.example.ui.components.PdfChatMessage(
+            id = "u1",
+            isUser = true,
+            engine = PdfChatEngineOption.LOCAL_GEMMA_E2B,
+            text = "What is the Hemoglobin value?"
+        )
+        val turn1Reply = generateLocalGemmaE2bPdfAnswer(
+            file = samplePdf,
+            pagesText = cleanedPages.map { it.normalizedText },
+            question = turn1User.text,
+            extractionResult = extraction
+        )
+        assertTrue(turn1Reply.text.contains("14.8 g/dL"))
+
+        // Turn 2: Ask a pronoun follow-up ("What is the normal range for it?") relying on conversational memory
+        val turn2Reply = generateLocalGemmaE2bPdfAnswer(
+            file = samplePdf,
+            pagesText = cleanedPages.map { it.normalizedText },
+            question = "What is the normal range for it?",
+            extractionResult = extraction,
+            conversationHistory = listOf(turn1User, turn1Reply)
+        )
+        assertTrue(turn2Reply.text.contains("13.2 - 16.6") || turn2Reply.text.contains("14.8 g/dL"))
+        assertTrue(turn2Reply.text.contains("Follow-up Context"))
+    }
 }
+
 

@@ -376,21 +376,40 @@ internal data class PdfPassageMatch(
     val pageNumber: Int,
     val snippet: String,
     val score: Double,
-    val source: ExtractionSource = ExtractionSource.PDF_TEXT
+    val source: ExtractionSource = ExtractionSource.PDF_TEXT,
+    val sectionHeading: String? = null
+)
+
+internal data class ResolvedConversationalQuery(
+    val originalQuestion: String,
+    val effectiveQueryText: String,
+    val inheritedTopicTokens: List<String>,
+    val inheritedPageNumbers: Set<Int>,
+    val isFollowUpTurn: Boolean
 )
 
 /**
- * Generates an on-device Local Gemma E2B answer using sentence-aware [TextChunk]s and
- * multi-signal BM25 + semantic intent synthesis over the hybrid-extracted PDF content.
+ * Generates an on-device Local Gemma E2B answer using:
+ * 1. Multi-Turn Conversational Memory & Coreference Resolution ([conversationHistory]),
+ * 2. Section-Heading Context Inheritance (parent-child chunking),
+ * 3. BM25/IDF + Character 3-Gram Fuzzy Matching + 5-Word Sliding-Window Phrase Proximity,
+ * 4. Maximal Marginal Relevance (MMR) Diversity Re-Ranking, and
+ * 5. Extractive TextRank / Centroid + Intent-Aware Synthesis.
  */
 internal fun generateLocalGemmaE2bPdfAnswer(
     file: PhoneFileItem,
     pagesText: List<String>,
     question: String,
-    extractionResult: DocumentExtractionResult? = null
+    extractionResult: DocumentExtractionResult? = null,
+    conversationHistory: List<PdfChatMessage> = emptyList()
 ): PdfChatMessage {
     val resolvedExtraction = extractionResult ?: buildExtractionResultFromRawPages(file, pagesText)
-    val rankedPassages = retrieveRelevantChunksAndPassages(resolvedExtraction, question)
+    val conversationalQuery = resolveFollowUpQueryWithMemory(question, conversationHistory)
+    val rankedPassages = retrieveRelevantChunksAndPassages(
+        extraction = resolvedExtraction,
+        question = conversationalQuery.effectiveQueryText,
+        preferredPages = conversationalQuery.inheritedPageNumbers
+    )
     val citations = if (rankedPassages.isNotEmpty()) {
         rankedPassages.map { match ->
             if (match.source == ExtractionSource.ML_KIT_OCR) {
@@ -407,7 +426,8 @@ internal fun generateLocalGemmaE2bPdfAnswer(
         file = file,
         extraction = resolvedExtraction,
         topPassages = rankedPassages,
-        question = question
+        question = question,
+        conversationalQuery = conversationalQuery
     )
 
     return PdfChatMessage(
@@ -420,12 +440,117 @@ internal fun generateLocalGemmaE2bPdfAnswer(
     )
 }
 
+/**
+ * Resolves pronouns ("it", "that", "this", "they") and conversational follow-ups
+ * ("is it normal?", "what about on page 2?", "explain more") using the recent chat history.
+ */
+internal fun resolveFollowUpQueryWithMemory(
+    question: String,
+    history: List<PdfChatMessage>
+): ResolvedConversationalQuery {
+    val trimmed = question.trim()
+    val lower = trimmed.lowercase(Locale.ROOT)
+    val currentWords = lower.split(Regex("[^a-z0-9]+")).filter { it.isNotEmpty() }
+    val substantiveCurrentTokens = currentWords.filter { it.length >= 3 && it !in ragStopWords && it !in followUpPronouns }
+
+    val hasPronounReference = currentWords.any { it in followUpPronouns }
+    val hasEllipsisStarter = lower.startsWith("what about") ||
+        lower.startsWith("how about") ||
+        lower.startsWith("and ") ||
+        lower.startsWith("also ") ||
+        lower.startsWith("is it") ||
+        lower.startsWith("are they") ||
+        lower.startsWith("was it") ||
+        lower.startsWith("why") ||
+        lower.startsWith("explain") ||
+        lower.contains("more detail") ||
+        lower.contains("that page") ||
+        lower.contains("same page") ||
+        lower.contains("normal range") ||
+        lower.contains("within range")
+
+    val isFollowUpCandidate = history.isNotEmpty() &&
+        (hasPronounReference || hasEllipsisStarter || substantiveCurrentTokens.size <= 1)
+
+    if (!isFollowUpCandidate) {
+        return ResolvedConversationalQuery(
+            originalQuestion = trimmed,
+            effectiveQueryText = trimmed,
+            inheritedTopicTokens = emptyList(),
+            inheritedPageNumbers = emptySet(),
+            isFollowUpTurn = false
+        )
+    }
+
+    // Look back at the most recent non-welcome user question and assistant reply
+    val previousUserQuestions = history
+        .filter { it.isUser && !it.text.equals(trimmed, ignoreCase = true) }
+        .takeLast(2)
+    val previousAssistantReplies = history
+        .filter { !it.isUser && !it.id.startsWith("welcome_") && !it.isStreaming && !it.isError }
+        .takeLast(2)
+
+    val inheritedTokens = mutableListOf<String>()
+    for (prevUser in previousUserQuestions.asReversed()) {
+        val tokens = prevUser.text.lowercase(Locale.ROOT)
+            .split(Regex("[^a-z0-9.%$]+"))
+            .map { it.trim('.', ',', '$', '%') }
+            .filter { it.length >= 3 && it !in ragStopWords && it !in followUpPronouns }
+        for (t in tokens) {
+            if (t !in inheritedTokens && t !in substantiveCurrentTokens) {
+                inheritedTokens.add(t)
+            }
+        }
+    }
+
+    // If previous user query was generic, also pull top capitalized/domain entities from previous assistant answer
+    if (inheritedTokens.size < 3) {
+        for (prevAssistant in previousAssistantReplies.asReversed()) {
+            val firstLines = prevAssistant.text.lines().take(3).joinToString(" ")
+            val tokens = firstLines.lowercase(Locale.ROOT)
+                .split(Regex("[^a-z0-9]+"))
+                .filter { it.length >= 4 && it !in ragStopWords && it !in followUpPronouns }
+            for (t in tokens.take(5)) {
+                if (t !in inheritedTokens && t !in substantiveCurrentTokens) {
+                    inheritedTokens.add(t)
+                }
+            }
+        }
+    }
+
+    val inheritedPages = previousAssistantReplies
+        .flatMap { it.pageCitations }
+        .mapNotNull { citation ->
+            Regex("Page\\s+(\\d+)", RegexOption.IGNORE_CASE).find(citation)?.groupValues?.getOrNull(1)?.toIntOrNull()
+        }
+        .toSet()
+
+    val topInherited = inheritedTokens.take(5)
+    val effectiveQuery = if (topInherited.isNotEmpty()) {
+        "$trimmed ${topInherited.joinToString(" ")}"
+    } else {
+        trimmed
+    }
+
+    return ResolvedConversationalQuery(
+        originalQuestion = trimmed,
+        effectiveQueryText = effectiveQuery,
+        inheritedTopicTokens = topInherited,
+        inheritedPageNumbers = inheritedPages,
+        isFollowUpTurn = topInherited.isNotEmpty() || inheritedPages.isNotEmpty()
+    )
+}
+
+private val followUpPronouns = setOf(
+    "it", "its", "that", "this", "they", "them", "their", "these", "those", "there", "same"
+)
+
 private fun buildExtractionResultFromRawPages(
     file: PhoneFileItem,
     pagesText: List<String>
 ): DocumentExtractionResult {
     val docUri = runCatching { Uri.parse("file://${file.fullPath}") }.getOrElse { Uri.EMPTY }
-    val extractedPages = pagesText.mapIndexed { idx, rawPage ->
+    val rawPages = pagesText.mapIndexed { idx, rawPage ->
         val normalized = TextNormalizer.normalize(rawPage)
         ExtractedPage(
             pageNumber = idx + 1,
@@ -434,17 +559,19 @@ private fun buildExtractionResultFromRawPages(
             source = ExtractionSource.PDF_TEXT
         )
     }
+    val (cleanedPages, removedHeadersCount) = TextNormalizer.stripCrossPageRunningHeadersAndFooters(rawPages)
     val chunks = TextChunker.chunkPages(
         documentUri = docUri,
-        pages = extractedPages,
+        pages = cleanedPages,
         maxChunkChars = 800,
         overlapChars = 100
     )
     return DocumentExtractionResult(
         documentUri = docUri,
-        totalPages = extractedPages.size,
-        pages = extractedPages,
-        chunks = chunks
+        totalPages = cleanedPages.size,
+        pages = cleanedPages,
+        chunks = chunks,
+        removedRunningHeadersCount = removedHeadersCount
     )
 }
 
@@ -457,11 +584,13 @@ private val ragStopWords = setOf(
 )
 
 private val domainSynonymGroups: List<Set<String>> = listOf(
-    setOf("total", "amount", "balance", "cost", "price", "fee", "sum", "paid", "payment", "invoice", "charge", "expense", "credit", "debit"),
-    setOf("date", "when", "time", "day", "month", "year", "period", "schedule", "deadline", "timestamp"),
+    setOf("total", "amount", "balance", "cost", "price", "fee", "sum", "paid", "payment", "invoice", "charge", "expense", "credit", "debit", "due", "subtotal"),
+    setOf("date", "when", "time", "day", "month", "year", "period", "schedule", "deadline", "timestamp", "issued"),
     setOf("summary", "summarize", "overview", "abstract", "synopsis", "main", "purpose", "topic", "subject", "about"),
-    setOf("finding", "findings", "result", "results", "conclusion", "conclusions", "outcome", "value", "values", "impression", "diagnosis", "status"),
-    setOf("number", "numbers", "figure", "figures", "metric", "metrics", "statistic", "statistics", "count", "rate", "percentage", "level", "range"),
+    setOf("finding", "findings", "result", "results", "conclusion", "conclusions", "outcome", "value", "values", "impression", "diagnosis", "status", "normal", "range", "reference"),
+    setOf("number", "numbers", "figure", "figures", "metric", "metrics", "statistic", "statistics", "count", "rate", "percentage", "level", "range", "measurement"),
+    setOf("sugar", "glucose", "glycemic", "hba1c", "fasting", "metabolic", "diabetes"),
+    setOf("blood", "hemoglobin", "hematology", "cbc", "cholesterol", "lipid", "hdl", "ldl", "wbc", "rbc", "platelet"),
     setOf("author", "who", "person", "patient", "client", "customer", "company", "organization", "vendor", "provider", "name")
 )
 
@@ -498,7 +627,7 @@ internal fun retrieveRelevantPdfPassages(
 ): List<PdfPassageMatch> {
     if (pagesText.isEmpty()) return emptyList()
     val dummyUri = Uri.EMPTY
-    val pages = pagesText.mapIndexed { index, text ->
+    val rawPages = pagesText.mapIndexed { index, text ->
         ExtractedPage(
             pageNumber = index + 1,
             rawText = text,
@@ -506,22 +635,26 @@ internal fun retrieveRelevantPdfPassages(
             source = ExtractionSource.PDF_TEXT
         )
     }
+    val (pages, removedHeaders) = TextNormalizer.stripCrossPageRunningHeadersAndFooters(rawPages)
     val chunks = TextChunker.chunkPages(dummyUri, pages, maxChunkChars = 800, overlapChars = 100)
     val extraction = DocumentExtractionResult(
         documentUri = dummyUri,
         totalPages = pages.size,
         pages = pages,
-        chunks = chunks
+        chunks = chunks,
+        removedRunningHeadersCount = removedHeaders
     )
     return retrieveRelevantChunksAndPassages(extraction, question)
 }
 
 /**
- * Multi-signal BM25 + semantic intent retrieval over sentence-aware [TextChunk]s and sentences.
+ * Multi-signal BM25/IDF + Character 3-Gram Fuzzy Similarity + 5-Word Phrase Proximity Window +
+ * Section-Heading Inheritance + Maximal Marginal Relevance (MMR) Diversity Re-Ranking.
  */
 internal fun retrieveRelevantChunksAndPassages(
     extraction: DocumentExtractionResult,
-    question: String
+    question: String,
+    preferredPages: Set<Int> = emptySet()
 ): List<PdfPassageMatch> {
     if (extraction.pages.isEmpty()) return emptyList()
 
@@ -532,7 +665,12 @@ internal fun retrieveRelevantChunksAndPassages(
         .filter { it.length >= 2 && it !in ragStopWords }
         .distinct()
 
+    val queryTrigrams = extractCharTrigrams(queryTokens.joinToString(" "))
     val expandedTerms = expandQueryTerms(queryTokens)
+
+    // Detect explicit page number mention in query (e.g., "on page 2")
+    val explicitPageTarget = Regex("\\bpage\\s+(\\d+)\\b", RegexOption.IGNORE_CASE)
+        .find(lowerQ)?.groupValues?.getOrNull(1)?.toIntOrNull()
 
     val wantsNumbers = lowerQ.contains("number") || lowerQ.contains("amount") ||
         lowerQ.contains("total") || lowerQ.contains("balance") ||
@@ -547,13 +685,17 @@ internal fun retrieveRelevantChunksAndPassages(
 
     val wantsFindings = lowerQ.contains("finding") || lowerQ.contains("result") ||
         lowerQ.contains("conclusion") || lowerQ.contains("main") ||
-        lowerQ.contains("key") || lowerQ.contains("important") || lowerQ.contains("summary")
+        lowerQ.contains("key") || lowerQ.contains("important") || lowerQ.contains("summary") ||
+        lowerQ.contains("normal") || lowerQ.contains("range")
 
-    // Collect candidate sentences from sentence-aware chunks across all pages
+    // Collect candidate sentences annotated with their inherited active section heading
     data class CandidateSentence(
         val pageNumber: Int,
         val text: String,
         val tokens: List<String>,
+        val sectionHeading: String?,
+        val sectionTokens: Set<String>,
+        val trigrams: Set<String>,
         val source: ExtractionSource
     )
 
@@ -562,44 +704,54 @@ internal fun retrieveRelevantChunksAndPassages(
         val cleanPageLines = page.normalizedText
             .lines()
             .map { it.trim() }
-            .filter { it.length >= 8 && !isBoilerplateMetadataLine(it) }
+            .filter { it.length >= 6 && !isBoilerplateMetadataLine(it) }
 
         val cleanedPageBody = cleanPageLines.joinToString("\n")
-        val sentences = TextChunker.splitIntoSentences(cleanedPageBody)
-            .flatMap { sent ->
-                // If a sentence block contains multiple bullet lines, also evaluate individual informative lines
-                if (sent.contains('\n') && sent.length > 180) {
-                    sent.lines().map { it.trim() }.filter { it.length >= 12 }
-                } else {
-                    listOf(sent.replace('\n', ' ').trim())
-                }
-            }
-            .filter { it.length >= 10 && !isBoilerplateMetadataLine(it) }
+        val annotatedUnits = TextChunker.extractSectionAnnotatedSentences(cleanedPageBody)
 
-        for (sent in sentences) {
-            val sentTokens = sent.lowercase(Locale.ROOT)
-                .split(Regex("[^a-z0-9]+"))
-                .filter { it.length >= 2 }
-            if (sentTokens.isNotEmpty()) {
-                allCandidates.add(
-                    CandidateSentence(
-                        pageNumber = page.pageNumber,
-                        text = sent,
-                        tokens = sentTokens,
-                        source = page.source
+        for ((rawUnit, sectionHeading) in annotatedUnits) {
+            val subUnits = if (rawUnit.contains('\n') && rawUnit.length > 180) {
+                rawUnit.lines().map { it.trim() }.filter { it.length >= 10 }
+            } else {
+                listOf(rawUnit.replace('\n', ' ').trim())
+            }
+
+            val secTokens = sectionHeading
+                ?.lowercase(Locale.ROOT)
+                ?.split(Regex("[^a-z0-9]+"))
+                ?.filter { it.length >= 2 && it !in ragStopWords }
+                ?.toSet()
+                ?: emptySet()
+
+            for (sent in subUnits) {
+                if (sent.length < 10 || isBoilerplateMetadataLine(sent)) continue
+                val sentTokens = sent.lowercase(Locale.ROOT)
+                    .split(Regex("[^a-z0-9]+"))
+                    .filter { it.length >= 2 }
+                if (sentTokens.isNotEmpty()) {
+                    allCandidates.add(
+                        CandidateSentence(
+                            pageNumber = page.pageNumber,
+                            text = sent,
+                            tokens = sentTokens,
+                            sectionHeading = sectionHeading,
+                            sectionTokens = secTokens,
+                            trigrams = extractCharTrigrams(sent),
+                            source = page.source
+                        )
                     )
-                )
+                }
             }
         }
     }
 
     if (allCandidates.isEmpty()) return emptyList()
 
-    // Compute inverse document frequency (IDF) across candidate sentences
+    // Compute inverse document frequency (IDF) across candidate sentences + inherited section headers
     val totalDocs = allCandidates.size.coerceAtLeast(1)
     val docFreq = mutableMapOf<String, Int>()
     for (candidate in allCandidates) {
-        for (uniqueToken in candidate.tokens.toSet()) {
+        for (uniqueToken in (candidate.tokens.toSet() + candidate.sectionTokens)) {
             docFreq[uniqueToken] = (docFreq[uniqueToken] ?: 0) + 1
         }
     }
@@ -614,8 +766,9 @@ internal fun retrieveRelevantChunksAndPassages(
         val tokenSet = candidate.tokens.toSet()
         var score = 0.0
 
-        // 1. Exact & Stem Query Token Matches (weighted by IDF)
+        // 1. Exact, Stem & Inherited Section-Heading Matches (weighted by IDF)
         var exactQueryHits = 0
+        var sectionHeaderHits = 0
         for (qToken in queryTokens) {
             val weight = idf(qToken).coerceAtLeast(0.8)
             when {
@@ -624,86 +777,234 @@ internal fun retrieveRelevantChunksAndPassages(
                     exactQueryHits++
                 }
                 qToken.length >= 4 && tokenSet.any { it.startsWith(qToken.take(4)) || qToken.startsWith(it.take(4)) } -> {
-                    score += 2.0 * weight
+                    score += 2.1 * weight
                     exactQueryHits++
                 }
                 lowerSent.contains(qToken) -> {
-                    score += 1.4 * weight
+                    score += 1.45 * weight
                     exactQueryHits++
+                }
+            }
+
+            // Parent-Child Section-Heading Context Inheritance Bonus
+            if (qToken in candidate.sectionTokens ||
+                (qToken.length >= 4 && candidate.sectionTokens.any { it.startsWith(qToken.take(4)) })
+            ) {
+                score += 1.75 * weight
+                sectionHeaderHits++
+            }
+        }
+
+        // 2. 5-Word Sliding-Window Phrase Proximity Bonus
+        if (queryTokens.size >= 2 && exactQueryHits >= 2) {
+            val proximityBonus = computePhraseProximityBonus(candidate.tokens, queryTokens)
+            score += exactQueryHits * 1.6 + proximityBonus
+        } else if (exactQueryHits >= 1 && sectionHeaderHits >= 1) {
+            score += 1.8
+        }
+
+        // 3. Character 3-Gram Fuzzy Cosine Similarity (resilient to OCR typos & spelling variations)
+        if (queryTrigrams.isNotEmpty() && candidate.trigrams.isNotEmpty()) {
+            val trigramSim = computeTrigramCosineSimilarity(queryTrigrams, candidate.trigrams)
+            if (trigramSim >= 0.14) {
+                score += trigramSim * 3.4
+            }
+        }
+
+        // 4. Domain Synonym Expansion Matches
+        for (syn in expandedTerms) {
+            if (syn !in queryTokens) {
+                if (syn in tokenSet) {
+                    score += 0.85 * idf(syn).coerceAtLeast(0.5)
+                } else if (syn in candidate.sectionTokens) {
+                    score += 0.55 * idf(syn).coerceAtLeast(0.5)
                 }
             }
         }
 
-        // Phrase / Multi-word query match bonus
-        if (exactQueryHits >= 2) {
-            score += exactQueryHits * 1.8
-        }
-
-        // 2. Domain Synonym Expansion Matches
-        for (syn in expandedTerms) {
-            if (syn !in queryTokens && syn in tokenSet) {
-                score += 0.85 * idf(syn).coerceAtLeast(0.5)
-            }
-        }
-
-        // 3. Quantitative / Date / Finding Intent Alignment
+        // 5. Quantitative / Date / Table Row / Finding Intent Alignment
         val hasDigits = candidate.text.any { it.isDigit() }
+        val isTableRow = candidate.text.contains(" | ")
         val hasCurrencyOrPercent = candidate.text.any { it == '$' || it == '%' || it == '€' || it == '£' || it == '₹' }
-        val hasDatePattern = Regex("\\b(\\d{1,4}[/-]\\d{1,2}[/-]\\d{1,4}|20\\d{2}|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\\b", RegexOption.IGNORE_CASE)
-            .containsMatchIn(candidate.text)
+        val hasDatePattern = Regex(
+            "\\b(\\d{1,4}[/-]\\d{1,2}[/-]\\d{1,4}|20\\d{2}|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\\b",
+            RegexOption.IGNORE_CASE
+        ).containsMatchIn(candidate.text)
 
         if (wantsNumbers && hasDigits) {
-            score += if (hasCurrencyOrPercent) 2.4 else 1.5
+            score += if (hasCurrencyOrPercent || isTableRow) 2.5 else 1.5
         }
         if (wantsDates && (hasDatePattern || hasDigits)) {
             score += if (hasDatePattern) 2.3 else 0.9
         }
-        if (wantsFindings && (hasDigits || candidate.tokens.size in 7..35)) {
-            score += 0.9
+        if (wantsFindings && (hasDigits || isTableRow || candidate.tokens.size in 7..38)) {
+            score += 0.95
         }
 
-        // 4. Information Density & Sentence Quality Score (reward real multi-word sentences over isolated ALL-CAPS headers)
+        // 6. Explicit or Conversational Follow-up Page Preference
+        if (explicitPageTarget != null && candidate.pageNumber == explicitPageTarget) {
+            score += 3.5
+        } else if (candidate.pageNumber in preferredPages && (exactQueryHits > 0 || sectionHeaderHits > 0)) {
+            score += 1.15
+        }
+
+        // 7. Information Density & Sentence Quality Score
         val wordCount = candidate.tokens.size
         val isAllCapsHeader = candidate.text.count { it.isUpperCase() }.toFloat() /
             candidate.text.count { it.isLetter() }.coerceAtLeast(1).toFloat() > 0.78f
-        if (wordCount in 6..42 && !isAllCapsHeader) {
+        if ((wordCount in 5..45 || isTableRow) && !isAllCapsHeader) {
             score += 0.65
         } else if (isAllCapsHeader && exactQueryHits == 0) {
-            score -= 0.5
+            score -= 0.55
         }
 
         if (hasDigits) {
             score += 0.35
         }
 
-        // Tiny positional tie-breaker so earlier substantive sentences win only when scores are truly equal
         score += (1.0 / (idx + 10.0)) * 0.05
 
         PdfPassageMatch(
             pageNumber = candidate.pageNumber,
             snippet = candidate.text.take(360),
             score = score,
-            source = candidate.source
+            source = candidate.source,
+            sectionHeading = candidate.sectionHeading
         )
     }
 
-    return scoredMatches
+    // 8. Maximal Marginal Relevance (MMR) Diversity Re-Ranking (lambda = 0.72)
+    return selectDiverseWithMmr(
+        candidates = scoredMatches,
+        lambda = 0.72,
+        topK = 5
+    )
+}
+
+/**
+ * Computes a sliding-window phrase proximity bonus when multiple query tokens appear within
+ * a 5-word window inside the sentence.
+ */
+private fun computePhraseProximityBonus(
+    sentenceTokens: List<String>,
+    queryTokens: List<String>
+): Double {
+    if (sentenceTokens.size <= 1 || queryTokens.size <= 1) return 0.0
+    val qPrefixes = queryTokens.map { if (it.length >= 4) it.take(4) else it }
+    val windowSize = 5
+    var maxWindowMatches = 0
+
+    for (start in sentenceTokens.indices) {
+        val end = (start + windowSize).coerceAtMost(sentenceTokens.size)
+        val windowSlice = sentenceTokens.subList(start, end)
+        val matchedQueries = qPrefixes.count { qPref ->
+            windowSlice.any { sTok -> sTok == qPref || (qPref.length >= 4 && sTok.startsWith(qPref)) }
+        }
+        if (matchedQueries > maxWindowMatches) {
+            maxWindowMatches = matchedQueries
+        }
+    }
+
+    return if (maxWindowMatches >= 2) {
+        maxWindowMatches * 1.35
+    } else {
+        0.0
+    }
+}
+
+private fun extractCharTrigrams(text: String): Set<String> {
+    val normalized = text.lowercase(Locale.ROOT)
+        .replace(Regex("[^a-z0-9]+"), " ")
+        .trim()
+    if (normalized.length < 3) return if (normalized.isEmpty()) emptySet() else setOf(normalized)
+    val trigrams = mutableSetOf<String>()
+    for (i in 0..normalized.length - 3) {
+        trigrams.add(normalized.substring(i, i + 3))
+    }
+    return trigrams
+}
+
+private fun computeTrigramCosineSimilarity(a: Set<String>, b: Set<String>): Double {
+    if (a.isEmpty() || b.isEmpty()) return 0.0
+    var intersection = 0
+    val smaller = if (a.size <= b.size) a else b
+    val larger = if (a.size <= b.size) b else a
+    for (gram in smaller) {
+        if (gram in larger) intersection++
+    }
+    if (intersection == 0) return 0.0
+    return intersection.toDouble() / kotlin.math.sqrt(a.size.toDouble() * b.size.toDouble())
+}
+
+/**
+ * Selects top-K passages using Maximal Marginal Relevance (MMR):
+ *   MMR(s_i) = lambda * Rel(s_i) - (1 - lambda) * max_{s_j in Selected} Sim(s_i, s_j)
+ * ensuring retrieved answers cover distinct facts rather than repeating near-duplicate sentences.
+ */
+private fun selectDiverseWithMmr(
+    candidates: List<PdfPassageMatch>,
+    lambda: Double = 0.72,
+    topK: Int = 5
+): List<PdfPassageMatch> {
+    val dedupedPool = candidates
         .sortedByDescending { it.score }
         .distinctBy { it.snippet.lowercase(Locale.ROOT) }
-        .take(5)
+        .take(22)
+        .toMutableList()
+
+    if (dedupedPool.size <= 1) return dedupedPool
+
+    val maxScore = dedupedPool.first().score.coerceAtLeast(1e-6)
+    val selected = mutableListOf<PdfPassageMatch>()
+    val selectedTrigrams = mutableListOf<Set<String>>()
+
+    // Pick the single highest-relevance passage first
+    val first = dedupedPool.removeAt(0)
+    selected.add(first)
+    selectedTrigrams.add(extractCharTrigrams(first.snippet))
+
+    while (selected.size < topK && dedupedPool.isNotEmpty()) {
+        var bestIdx = 0
+        var bestMmrScore = Double.NEGATIVE_INFINITY
+
+        for ((idx, candidate) in dedupedPool.withIndex()) {
+            val candTrigrams = extractCharTrigrams(candidate.snippet)
+            val maxSimToSelected = selectedTrigrams.maxOfOrNull { selTrigrams ->
+                computeTrigramCosineSimilarity(candTrigrams, selTrigrams)
+            } ?: 0.0
+
+            // Hard skip near-identical sentences (> 0.78 trigram overlap)
+            if (maxSimToSelected > 0.78) continue
+
+            val normalizedRelevance = candidate.score / maxScore
+            val mmr = lambda * normalizedRelevance - (1.0 - lambda) * maxSimToSelected
+            if (mmr > bestMmrScore) {
+                bestMmrScore = mmr
+                bestIdx = idx
+            }
+        }
+
+        if (bestMmrScore == Double.NEGATIVE_INFINITY) break
+        val chosen = dedupedPool.removeAt(bestIdx)
+        selected.add(chosen)
+        selectedTrigrams.add(extractCharTrigrams(chosen.snippet))
+    }
+
+    return selected
 }
 
 /**
  * Extractive TextRank / Centroid + Intent-Aware Synthesizer for Local Gemma E2B.
- * Produces rich, multi-paragraph, page-cited answers grounded in the extracted PDF chunks.
+ * Produces rich, multi-paragraph, page- and section-cited answers grounded in the extracted PDF chunks.
  */
 private fun synthesizeLocalGemmaResponse(
     file: PhoneFileItem,
     extraction: DocumentExtractionResult,
     topPassages: List<PdfPassageMatch>,
-    question: String
+    question: String,
+    conversationalQuery: ResolvedConversationalQuery? = null
 ): String {
-    val lowerQ = question.lowercase(Locale.ROOT)
+    val lowerQ = (conversationalQuery?.effectiveQueryText ?: question).lowercase(Locale.ROOT)
     val pages = extraction.pages
     val totalPages = pages.size.coerceAtLeast(1)
     val ocrPageCount = pages.count { it.source == ExtractionSource.ML_KIT_OCR }
@@ -718,30 +1019,39 @@ private fun synthesizeLocalGemmaResponse(
             "$totalPages ${if (totalPages == 1) "page" else "pages"} (extracted via PDFBox digital text layer)"
     }
 
-    val isSummaryQuery = lowerQ.contains("summarize") || lowerQ.contains("summary") ||
-        lowerQ.contains("overview") || lowerQ.contains("what is this") ||
-        lowerQ.contains("about") || lowerQ.contains("tl;dr") || lowerQ.contains("main points")
+    val rawLowerQ = question.lowercase(Locale.ROOT)
+    val isSummaryQuery = rawLowerQ.contains("summarize") || rawLowerQ.contains("summary") ||
+        rawLowerQ.contains("overview") || rawLowerQ.contains("what is this") ||
+        rawLowerQ.contains("about") || rawLowerQ.contains("tl;dr") || rawLowerQ.contains("main points")
 
-    val isNumbersOrDatesQuery = lowerQ.contains("key numbers") || lowerQ.contains("dates & totals") ||
-        lowerQ.contains("numbers, dates") || lowerQ.contains("all numbers") ||
-        lowerQ.contains("amounts") || lowerQ.contains("figures")
+    val isNumbersOrDatesQuery = rawLowerQ.contains("key numbers") || rawLowerQ.contains("dates & totals") ||
+        rawLowerQ.contains("numbers, dates") || rawLowerQ.contains("all numbers") ||
+        rawLowerQ.contains("amounts") || rawLowerQ.contains("figures")
 
-    val isFindingsQuery = lowerQ.contains("main findings") || lowerQ.contains("findings & values") ||
-        lowerQ.contains("key findings") || lowerQ.contains("conclusions") ||
-        lowerQ.contains("takeaways")
+    val isFindingsQuery = rawLowerQ.contains("main findings") || rawLowerQ.contains("findings & values") ||
+        rawLowerQ.contains("key findings") || rawLowerQ.contains("conclusions") ||
+        rawLowerQ.contains("takeaways")
 
-    val isPageOutlineQuery = lowerQ.contains("list all pages") || lowerQ.contains("pages & sections") ||
-        lowerQ.contains("table of contents") || lowerQ.contains("sections")
+    val isPageOutlineQuery = rawLowerQ.contains("list all pages") || rawLowerQ.contains("pages & sections") ||
+        rawLowerQ.contains("table of contents") || rawLowerQ.contains("sections")
 
     // 1. Executive Document Summary Mode
     if (isSummaryQuery) {
         val topTopics = extractTopDocumentKeyphrases(extraction, limit = 6)
         val salientSentences = extractSalientSummarySentences(extraction, maxSentences = 5)
         val keyMetrics = extractQuantitativeFacts(extraction, maxFacts = 5)
+        val allSections = pages.flatMap { it.detectedSections }.distinct().take(6)
 
         return buildString {
             append("Executive Summary — ${file.name}\n")
-            append("• Scope: $provenanceSummary • ${extraction.chunks.size} indexed sentence chunks.\n")
+            append("• Scope: $provenanceSummary • ${extraction.chunks.size} indexed sentence chunks")
+            if (extraction.removedRunningHeadersCount > 0) {
+                append(" (${extraction.removedRunningHeadersCount} repeated headers/footers stripped)")
+            }
+            append(".\n")
+            if (allSections.isNotEmpty()) {
+                append("• Detected Sections: ${allSections.joinToString(" • ")}\n")
+            }
             if (topTopics.isNotEmpty()) {
                 append("• Core Topics: ${topTopics.joinToString(", ")}\n")
             }
@@ -783,7 +1093,8 @@ private fun synthesizeLocalGemmaResponse(
                 }
             } else if (topPassages.isNotEmpty()) {
                 topPassages.forEach { match ->
-                    append("• [Page ${match.pageNumber}] ${match.snippet}\n")
+                    val secPrefix = match.sectionHeading?.let { "[$it] " }.orEmpty()
+                    append("• [Page ${match.pageNumber}] $secPrefix${match.snippet}\n")
                 }
             } else {
                 append("No explicit numerical totals, currency amounts, or dates were detected in the extracted text of ${file.name}.")
@@ -820,6 +1131,9 @@ private fun synthesizeLocalGemmaResponse(
                 val heading = extractPageHeadingOrTitle(page)
                 val digest = summarizeSinglePage(page)
                 append("• Page ${page.pageNumber} ($sourceTag) — $heading\n")
+                if (page.detectedSections.size > 1) {
+                    append("  Sections: ${page.detectedSections.joinToString(" • ")}\n")
+                }
                 if (digest.isNotBlank() && !digest.equals(heading, ignoreCase = true)) {
                     append("  $digest\n")
                 }
@@ -827,29 +1141,37 @@ private fun synthesizeLocalGemmaResponse(
         }.trim()
     }
 
-    // 5. Focused Question Answering over Top Ranked Sentence Chunks
+    // 5. Focused Question Answering over MMR-Ranked Sentence Chunks + Conversational Follow-up Context
     val bestMatches = topPassages.filter { it.score > 0.35 }.ifEmpty { topPassages.take(3) }
     return if (bestMatches.isNotEmpty()) {
         val primary = bestMatches.first()
         val supporting = bestMatches.drop(1).take(3)
 
-        // Also locate the surrounding 800-char TextChunk for richer paragraph context
+        // Locate the surrounding 800-char TextChunk for richer paragraph context
         val matchingChunk = extraction.chunks.firstOrNull { chunk ->
             chunk.pageNumber == primary.pageNumber &&
-                chunk.text.contains(primary.snippet.take(40), ignoreCase = true)
+                chunk.text.contains(primary.snippet.take(36), ignoreCase = true)
         }
 
         buildString {
-            append("Direct Answer (Page ${primary.pageNumber} • ${primary.source.badgeLabel}):\n")
+            if (conversationalQuery != null && conversationalQuery.isFollowUpTurn && conversationalQuery.inheritedTopicTokens.isNotEmpty()) {
+                append("Follow-up Context: Continuing from ")
+                append(conversationalQuery.inheritedTopicTokens.joinToString(", "))
+                append("\n\n")
+            }
+
+            val sectionLabel = primary.sectionHeading?.let { " • Section: $it" }.orEmpty()
+            append("Direct Answer (Page ${primary.pageNumber} • ${primary.source.badgeLabel}$sectionLabel):\n")
             append(primary.snippet)
             if (!primary.snippet.endsWith('.') && !primary.snippet.endsWith('!') && !primary.snippet.endsWith('?')) {
                 append('.')
             }
 
             if (supporting.isNotEmpty()) {
-                append("\n\nRelated Findings Across Document:\n")
+                append("\n\nRelated Findings Across Document (MMR Diverse):\n")
                 supporting.forEach { match ->
-                    append("• [Page ${match.pageNumber}] ${match.snippet}\n")
+                    val secTag = match.sectionHeading?.let { " [$it]" }.orEmpty()
+                    append("• [Page ${match.pageNumber}$secTag] ${match.snippet}\n")
                 }
             }
 
@@ -900,8 +1222,9 @@ private fun extractTopDocumentKeyphrases(
 }
 
 /**
- * Extractive TextRank / Centroid sentence selector that chooses the most informative,
- * high-centrality sentences across the PDF while skipping headers, footers, and metadata boilerplate.
+ * Extractive TextRank / Centroid sentence selector with MMR-style trigram deduplication (< 0.45)
+ * that chooses the most informative, high-centrality sentences across the PDF while skipping
+ * headers, footers, and metadata boilerplate.
  */
 private fun extractSalientSummarySentences(
     extraction: DocumentExtractionResult,
@@ -955,12 +1278,16 @@ private fun extractSalientSummarySentences(
     }
 
     val selected = mutableListOf<Pair<Int, String>>()
-    val seenNormalized = mutableSetOf<String>()
+    val selectedTrigrams = mutableListOf<Set<String>>()
 
     for ((pageNum, sentence, _) in scored.sortedByDescending { it.third }) {
-        val normKey = sentence.lowercase(Locale.ROOT).take(45)
-        if (seenNormalized.add(normKey)) {
+        val candTrigrams = extractCharTrigrams(sentence)
+        val tooSimilar = selectedTrigrams.any { existing ->
+            computeTrigramCosineSimilarity(candTrigrams, existing) > 0.52
+        }
+        if (!tooSimilar) {
             selected.add(pageNum to sentence)
+            selectedTrigrams.add(candTrigrams)
             if (selected.size >= maxSentences) break
         }
     }
@@ -970,7 +1297,7 @@ private fun extractSalientSummarySentences(
 
 /**
  * Extracts quantitative lines/sentences containing currency figures, percentages, dates,
- * reference ranges, or key-value metrics across all pages.
+ * reference ranges, or key-value/table metrics across all pages.
  */
 private fun extractQuantitativeFacts(
     extraction: DocumentExtractionResult,
@@ -979,7 +1306,7 @@ private fun extractQuantitativeFacts(
     val facts = mutableListOf<Pair<Int, String>>()
     val seen = mutableSetOf<String>()
     val metricRegex = Regex(
-        "(\\$[0-9,]+(\\.[0-9]{2})?|\\b\\d+(\\.\\d+)?\\s*(%|mg/dL|g/dL|mIU/L|U/L|uL|mL/min|MB|GB|KB|days|months|years|USD|EUR|INR)\\b|\\b\\d{1,2}[/-]\\d{1,2}[/-]\\d{2,4}\\b|\\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\\s+\\d{1,2}\\b)",
+        "(\\$[0-9,]+(\\.[0-9]{2})?|\\b\\d+(\\.\\d+)?\\s*(%|mg/dL|g/dL|mIU/L|U/L|uL|ng/mL|mL/min|MB|GB|KB|days|months|years|USD|EUR|INR)\\b|\\b\\d{1,2}[/-]\\d{1,2}[/-]\\d{2,4}\\b|\\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\\s+\\d{1,2}\\b)",
         RegexOption.IGNORE_CASE
     )
 
@@ -990,7 +1317,8 @@ private fun extractQuantitativeFacts(
             .filter { it.length in 10..240 && !isBoilerplateMetadataLine(it) }
 
         for (line in lines) {
-            if (metricRegex.containsMatchIn(line) || (line.contains(':') && line.any { it.isDigit() })) {
+            val isMetricTableLine = line.contains(" | ") && line.any { it.isDigit() }
+            if (metricRegex.containsMatchIn(line) || isMetricTableLine || (line.contains(':') && line.any { it.isDigit() })) {
                 val key = line.lowercase(Locale.ROOT)
                 if (seen.add(key)) {
                     facts.add(page.pageNumber to line)
@@ -1003,6 +1331,9 @@ private fun extractQuantitativeFacts(
 }
 
 private fun extractPageHeadingOrTitle(page: ExtractedPage): String {
+    if (page.detectedSections.isNotEmpty()) {
+        return page.detectedSections.first()
+    }
     val lines = page.normalizedText
         .lines()
         .map { it.trim() }
@@ -1122,6 +1453,7 @@ fun FullScreenPdfChatDialog(
                 },
                 isStreaming = true
             )
+            val priorConversationHistory = messages
             messages = messages + userMessage + initialPendingMessage
             questionInput = ""
             isGeneratingReply = true
@@ -1145,7 +1477,8 @@ fun FullScreenPdfChatDialog(
                                 file = file,
                                 pagesText = pagesForQuery,
                                 question = trimmed,
-                                extractionResult = currentExtraction
+                                extractionResult = currentExtraction,
+                                conversationHistory = priorConversationHistory
                             )
                         }
                     }

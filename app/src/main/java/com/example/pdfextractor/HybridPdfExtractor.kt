@@ -5,6 +5,10 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
+import android.graphics.Paint
+import android.graphics.Rect
 import android.graphics.pdf.PdfRenderer
 import android.net.Uri
 import android.os.Build
@@ -19,6 +23,7 @@ import com.example.pdfextractor.model.ExtractionSource
 import com.example.ui.components.buildSamplePdfPagesText
 import com.example.ui.components.cleanAndSanitizePdfPageText
 import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
@@ -27,6 +32,8 @@ import com.tom_roush.pdfbox.text.PDFTextStripper
 import java.io.File
 import java.io.FileOutputStream
 import kotlin.coroutines.coroutineContext
+import kotlin.math.abs
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
@@ -53,13 +60,16 @@ object HybridPdfExtractionCache {
 
 /**
  * Production-grade, memory-safe, per-page Hybrid PDF Text Extraction Pipeline:
- * - Stage 1 (Digital Text Layer): Extracts embedded text per page using PdfBox-Android (`PDFTextStripper`).
+ * - Stage 1 (Digital Text Layer): Extracts embedded text per page using PdfBox-Android (`PDFTextStripper`)
+ *   with tuned column/cell spacing tolerances (`spacingTolerance = 0.5f`, `averageCharTolerance = 0.3f`).
  * - Stage 2 (OCR Fallback): If a page's extracted text falls below a meaningful character/word/quality threshold,
- *   renders that single page to a Bitmap via Android's native `PdfRenderer` at 180 DPI (clamped to 2480px)
- *   and runs on-device OCR using Google ML Kit Text Recognition (`com.google.mlkit:text-recognition`),
- *   recycling the Bitmap immediately in a `finally` block for Zero OOMs.
- * - Stage 3 (Normalization & Chunking): Cleans extracted text (whitespace normalization, de-hyphenation,
- *   garble stripping) and splits into sentence-aware chunks with page provenance (`PDF_TEXT` vs `ML_KIT_OCR`).
+ *   renders that single page to a Bitmap via Android's native `PdfRenderer` at 180 DPI (clamped to 2480px),
+ *   applies an in-place high-contrast luminance pre-filter for faint scans, runs Google ML Kit Text Recognition,
+ *   reconstructs spatial table rows (`Cell 1 | Cell 2 | Cell 3`) via Y-bounding-box clustering, and recycles
+ *   the Bitmap immediately in a `finally` block for Zero OOMs.
+ * - Stage 3 (Cross-Page Header/Footer Deduplication, Normalization & Section-Aware Chunking):
+ *   Removes repeated running headers/footers across pages, normalizes text, detects section headings,
+ *   and splits into sentence-aware overlapping chunks with page and section provenance.
  */
 class HybridPdfExtractor(
     private val context: Context
@@ -85,7 +95,7 @@ class HybridPdfExtractor(
         config: ExtractionConfig = ExtractionConfig(),
         onPageProgress: ((currentPage: Int, totalPages: Int) -> Unit)? = null
     ): DocumentExtractionResult = withContext(Dispatchers.IO) {
-        val cacheKey = "${file.id}_${file.modifiedAtMillis}_ocr_${config.enableOcrFallback}"
+        val cacheKey = "${file.id}_${file.modifiedAtMillis}_ocr_${config.enableOcrFallback}_v2"
         HybridPdfExtractionCache.get(cacheKey)?.let { cached ->
             onPageProgress?.invoke(cached.totalPages, cached.totalPages)
             return@withContext cached
@@ -128,7 +138,7 @@ class HybridPdfExtractor(
         config: ExtractionConfig = ExtractionConfig(),
         onPageProgress: ((currentPage: Int, totalPages: Int) -> Unit)? = null
     ): DocumentExtractionResult = withContext(Dispatchers.IO) {
-        val extractedPages = mutableListOf<ExtractedPage>()
+        val rawExtractedPages = mutableListOf<ExtractedPage>()
         var tempCacheFile: File? = null
         var pfd: ParcelFileDescriptor? = null
         var pdfRenderer: PdfRenderer? = null
@@ -165,6 +175,9 @@ class HybridPdfExtractor(
                     val totalPages = doc.numberOfPages.coerceAtLeast(1)
                     val stripper = PDFTextStripper().apply {
                         sortByPosition = true
+                        spacingTolerance = 0.5f
+                        averageCharTolerance = 0.3f
+                        dropThreshold = 2.5f
                     }
 
                     for (pageIndex in 0 until totalPages) {
@@ -198,7 +211,7 @@ class HybridPdfExtractor(
                                 }
                             )
                         } else {
-                            // 2. Fallback: Render single page to Bitmap and run ML Kit OCR
+                            // 2. Fallback: Render single page to Bitmap and run ML Kit OCR with spatial row clustering
                             val ocrText = runCatching {
                                 extractPageWithOcr(getOrCreateRenderer(), pageIndex, config)
                             }.getOrDefault("")
@@ -222,7 +235,7 @@ class HybridPdfExtractor(
                             )
                         }
 
-                        extractedPages.add(pageResult)
+                        rawExtractedPages.add(pageResult)
                         onPageProgress?.invoke(pageNumber, totalPages)
 
                         if (config.throttleDelayMs > 0L && pageNumber < totalPages) {
@@ -242,7 +255,7 @@ class HybridPdfExtractor(
                         extractPageWithOcr(renderer, pageIndex, config)
                     }.getOrDefault("")
                     val normalized = TextNormalizer.normalize(ocrText)
-                    extractedPages.add(
+                    rawExtractedPages.add(
                         ExtractedPage(
                             pageNumber = pageNumber,
                             rawText = ocrText,
@@ -257,19 +270,27 @@ class HybridPdfExtractor(
                 }
             }
 
-            // 3. Build sentence-aware chunks with page provenance
+            // 3. Cross-page running header/footer deduplication & section discovery
+            val (cleanedPages, removedHeadersCount) = if (config.stripRunningHeadersFooters) {
+                TextNormalizer.stripCrossPageRunningHeadersAndFooters(rawExtractedPages)
+            } else {
+                rawExtractedPages to 0
+            }
+
+            // 4. Build sentence-aware chunks with page & section-heading provenance
             val chunks = TextChunker.chunkPages(
                 documentUri = uri,
-                pages = extractedPages,
+                pages = cleanedPages,
                 maxChunkChars = config.chunkSizeChars,
                 overlapChars = config.chunkOverlapChars
             )
 
             DocumentExtractionResult(
                 documentUri = uri,
-                totalPages = extractedPages.size,
-                pages = extractedPages,
-                chunks = chunks
+                totalPages = cleanedPages.size,
+                pages = cleanedPages,
+                chunks = chunks,
+                removedRunningHeadersCount = removedHeadersCount
             )
         } finally {
             runCatching { pdfRenderer?.close() }
@@ -301,34 +322,138 @@ class HybridPdfExtractor(
                 val bmp = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
                 bitmap = bmp
 
+                val canvas = Canvas(bmp)
                 // Fill white background so transparent PDFs render cleanly for OCR
-                Canvas(bmp).drawColor(Color.WHITE)
+                canvas.drawColor(Color.WHITE)
                 page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+
+                // In-place high-contrast luminance enhancement so faint scans & gray receipts sharpen before OCR
+                if (config.enhanceContrastForOcr) {
+                    applyInPlaceHighContrastFilter(canvas, bmp)
+                }
 
                 val inputImage = InputImage.fromBitmap(bmp, 0)
                 val visionText = textRecognizer.process(inputImage).await()
 
-                // Reconstruct reading order by sorting text blocks top-to-bottom, left-to-right
-                val orderedBlocks = visionText.textBlocks.sortedWith(
-                    compareBy<com.google.mlkit.vision.text.Text.TextBlock> { block ->
-                        (block.boundingBox?.top ?: 0) / 24
-                    }.thenBy { block ->
-                        block.boundingBox?.left ?: 0
-                    }
-                )
-                if (orderedBlocks.isNotEmpty()) {
-                    orderedBlocks.joinToString("\n\n") { block ->
-                        block.lines.joinToString("\n") { it.text.trim() }
-                    }
-                } else {
-                    visionText.text
-                }
+                reconstructSpatialTableAndLines(visionText)
             }
         } finally {
             bitmap?.let {
                 if (!it.isRecycled) it.recycle()
             }
         }
+    }
+
+    /**
+     * Applies an in-place high-contrast luminance curve onto the rendered page Bitmap without
+     * allocating a second Bitmap, boosting ML Kit recognition on faded scans and light-gray fonts.
+     */
+    private fun applyInPlaceHighContrastFilter(canvas: Canvas, bmp: Bitmap) {
+        val contrast = 1.22f
+        val translate = -18f
+        val matrix = ColorMatrix(
+            floatArrayOf(
+                contrast, 0f, 0f, 0f, translate,
+                0f, contrast, 0f, 0f, translate,
+                0f, 0f, contrast, 0f, translate,
+                0f, 0f, 0f, 1f, 0f
+            )
+        )
+        val paint = Paint().apply {
+            colorFilter = ColorMatrixColorFilter(matrix)
+        }
+        canvas.drawBitmap(bmp, 0f, 0f, paint)
+    }
+
+    /**
+     * Clusters ML Kit [Text.Line] elements by vertical Y-bounding-box overlap into horizontal rows,
+     * sorts cells left-to-right within each row, and inserts ` | ` delimiters between horizontally
+     * separated table cells so multi-column tables (lab panels, invoices, statements) stay intact row-by-row.
+     */
+    internal fun reconstructSpatialTableAndLines(visionText: Text): String {
+        data class PositionedLine(
+            val text: String,
+            val box: Rect,
+            val centerY: Float,
+            val height: Float
+        )
+
+        val positionedLines = mutableListOf<PositionedLine>()
+        for (block in visionText.textBlocks) {
+            for (line in block.lines) {
+                val clean = line.text.trim()
+                val box = line.boundingBox
+                if (clean.isNotEmpty() && box != null) {
+                    val h = (box.height()).coerceAtLeast(8).toFloat()
+                    val cy = box.exactCenterY()
+                    positionedLines.add(PositionedLine(clean, box, cy, h))
+                }
+            }
+        }
+
+        if (positionedLines.isEmpty()) {
+            return visionText.text
+        }
+
+        // Sort all lines top-to-bottom by vertical center, then left-to-right
+        val sortedByY = positionedLines.sortedWith(
+            compareBy<PositionedLine> { it.centerY }.thenBy { it.box.left }
+        )
+
+        // Cluster lines that share the same horizontal row band (deltaY <= 0.55 * lineHeight)
+        val rows = mutableListOf<MutableList<PositionedLine>>()
+        for (item in sortedByY) {
+            val matchingRow = rows.lastOrNull { row ->
+                val rowAvgCy = row.map { it.centerY }.average().toFloat()
+                val rowAvgH = row.map { it.height }.average().toFloat()
+                val threshold = max(rowAvgH, item.height) * 0.55f
+                abs(item.centerY - rowAvgCy) <= threshold
+            }
+            if (matchingRow != null) {
+                matchingRow.add(item)
+            } else {
+                rows.add(mutableListOf(item))
+            }
+        }
+
+        val sb = StringBuilder()
+        var prevRowBottom: Int? = null
+        var prevRowHeight = 16f
+
+        for (row in rows) {
+            val leftToRight = row.sortedBy { it.box.left }
+            val rowTop = leftToRight.minOf { it.box.top }
+            val rowBottom = leftToRight.maxOf { it.box.bottom }
+            val rowAvgH = leftToRight.map { it.height }.average().toFloat().coerceAtLeast(10f)
+
+            if (prevRowBottom != null) {
+                val verticalGap = rowTop - prevRowBottom
+                if (verticalGap > max(prevRowHeight, rowAvgH) * 1.65f) {
+                    sb.append("\n\n")
+                } else {
+                    sb.append('\n')
+                }
+            }
+
+            // Join cells in the same row: use " | " when horizontal gap indicates distinct table columns
+            for ((cellIdx, cell) in leftToRight.withIndex()) {
+                if (cellIdx > 0) {
+                    val prevCell = leftToRight[cellIdx - 1]
+                    val horizontalGap = cell.box.left - prevCell.box.right
+                    if (horizontalGap > rowAvgH * 0.85f) {
+                        sb.append(" | ")
+                    } else {
+                        sb.append(' ')
+                    }
+                }
+                sb.append(cell.text)
+            }
+
+            prevRowBottom = rowBottom
+            prevRowHeight = rowAvgH
+        }
+
+        return sb.toString().trim()
     }
 
     internal fun hasSufficientText(text: String, config: ExtractionConfig): Boolean {
@@ -432,7 +557,7 @@ class HybridPdfExtractor(
     ): DocumentExtractionResult {
         val sampleUri = Uri.parse("file://${file.fullPath}")
         val samplePagesText = buildSamplePdfPagesText(file)
-        val extractedPages = samplePagesText.mapIndexed { idx, pageText ->
+        val rawPages = samplePagesText.mapIndexed { idx, pageText ->
             val normalized = TextNormalizer.normalize(pageText)
             ExtractedPage(
                 pageNumber = idx + 1,
@@ -441,17 +566,23 @@ class HybridPdfExtractor(
                 source = ExtractionSource.PDF_TEXT
             )
         }
+        val (cleanedPages, removedHeadersCount) = if (config.stripRunningHeadersFooters) {
+            TextNormalizer.stripCrossPageRunningHeadersAndFooters(rawPages)
+        } else {
+            rawPages to 0
+        }
         val chunks = TextChunker.chunkPages(
             documentUri = sampleUri,
-            pages = extractedPages,
+            pages = cleanedPages,
             maxChunkChars = config.chunkSizeChars,
             overlapChars = config.chunkOverlapChars
         )
         return DocumentExtractionResult(
             documentUri = sampleUri,
-            totalPages = extractedPages.size,
-            pages = extractedPages,
-            chunks = chunks
+            totalPages = cleanedPages.size,
+            pages = cleanedPages,
+            chunks = chunks,
+            removedRunningHeadersCount = removedHeadersCount
         )
     }
 

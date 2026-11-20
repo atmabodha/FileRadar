@@ -1158,13 +1158,16 @@ private fun repairSpacedOutKerning(line: String): String {
  * a leaked PDF operator, or high-density symbol soup.
  */
 private fun sanitizePdfToken(rawToken: String): String? {
+    if (rawToken == "|") return "|"
+
     val trimmed = rawToken.trim { ch ->
         ch in "`~^|\\<>{}" || ch.code < 32
     }
     if (trimmed.isEmpty()) return null
 
-    // Allow standard bullet or list markers
+    // Allow standard bullet, list, or table column markers
     if (trimmed == "•" || trimmed == "-" || trimmed == "–") return "•"
+    if (trimmed == "<" || trimmed == ">") return trimmed
 
     // Reject leaked internal PDF/PostScript syntax keywords
     if (trimmed in pdfInternalOperatorRejectSet) return null
@@ -1186,7 +1189,7 @@ private fun sanitizePdfToken(rawToken: String): String? {
         when {
             ch.isLetter() -> letters++
             ch.isDigit() -> digits++
-            ch in ".,;:!?'\"()-/$%&•+@" -> standardPunct++
+            ch in ".,;:!?'\"()-/$%&•+@|" -> standardPunct++
             else -> noisySymbols++
         }
     }
@@ -1200,7 +1203,9 @@ private fun sanitizePdfToken(rawToken: String): String? {
     }
 
     // For tokens of length >= 3, require at least 55% alphanumeric characters
-    if (length >= 3 && alnum.toFloat() / length.toFloat() < 0.55f) {
+    // (exempting clean numeric/currency/percentage tokens with zero noisy symbols like "5.2%." or "$1.50,")
+    val isCleanNumericPunct = digits >= 1 && noisySymbols == 0
+    if (!isCleanNumericPunct && length >= 3 && alnum.toFloat() / length.toFloat() < 0.55f) {
         return null
     }
 
@@ -1246,7 +1251,7 @@ private fun isCleanReadableLine(line: String): Boolean {
             ch.isLetter() -> letters++
             ch.isDigit() -> digits++
             ch == ' ' -> spaces++
-            ch in ".,;:!?'\"()-/$%&•+@" -> cleanPunct++
+            ch in ".,;:!?'\"()-/$%&•+@|<>" -> cleanPunct++
             else -> otherChars++
         }
     }
