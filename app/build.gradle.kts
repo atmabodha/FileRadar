@@ -121,6 +121,11 @@ dependencies {
   implementation(libs.firebase.appcheck.debug)
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)
+  implementation(libs.kotlinx.coroutines.play.services)
+  implementation(libs.mlkit.text.recognition)
+  implementation(libs.pdfbox.android) {
+    exclude(group = "org.bouncycastle")
+  }
   // implementation(libs.logging.interceptor)
   // implementation(libs.moshi.kotlin)
   // implementation(libs.okhttp)

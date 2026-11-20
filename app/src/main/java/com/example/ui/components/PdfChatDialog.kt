@@ -1,8 +1,8 @@
 package com.example.ui.components
 
+import android.net.Uri
 import android.util.Log
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -53,6 +53,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -75,10 +76,18 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.example.R
 import com.example.model.PhoneFileItem
+import com.example.pdfextractor.HybridPdfExtractor
+import com.example.pdfextractor.TextChunker
+import com.example.pdfextractor.TextNormalizer
+import com.example.pdfextractor.model.DocumentExtractionResult
+import com.example.pdfextractor.model.ExtractedPage
+import com.example.pdfextractor.model.ExtractionSource
+import com.example.pdfextractor.model.TextChunk
 import com.google.firebase.Firebase
 import com.google.firebase.ai.ai
 import java.util.Locale
 import kotlin.coroutines.cancellation.CancellationException
+import kotlin.math.ln
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.launch
@@ -89,7 +98,7 @@ private const val TAG = "PdfChatAi"
 
 /**
  * Two selectable engines for chatting with a PDF document:
- * 1. [LOCAL_GEMMA_E2B]: 100% offline on-device Gemma E2B 4-bit RAG over extracted PDF chunks.
+ * 1. [LOCAL_GEMMA_E2B]: 100% offline on-device Gemma E2B 4-bit RAG over hybrid-extracted PDF chunks (PDFBox + ML Kit OCR).
  * 2. [GEMINI_SUBSCRIPTION]: Keyless Firebase AI Logic (`gemini-3.8-flash` free tier — no API key or paid billing).
  */
 enum class PdfChatEngineOption(
@@ -99,8 +108,8 @@ enum class PdfChatEngineOption(
 ) {
     LOCAL_GEMMA_E2B(
         displayName = "Local Gemma E2B",
-        subtitle = "On-Device 4-bit LLM • Offline RAG",
-        badgeLabel = "Gemma E2B (On-Device)"
+        subtitle = "On-Device Hybrid RAG • PDFBox + OCR",
+        badgeLabel = "Gemma E2B (On-Device RAG)"
     ),
     GEMINI_SUBSCRIPTION(
         displayName = "Gemini (Keyless Free Tier)",
@@ -152,30 +161,34 @@ class FirebaseAiLogicPdfChatRepository : PdfChatAiRepository {
         val rankedPassages = withContext(Dispatchers.Default) {
             retrieveRelevantPdfPassages(pagesText, question)
         }
-        val citations = rankedPassages.map { "Page ${it.pageNumber}" }.distinct()
+        val citations = if (rankedPassages.isNotEmpty()) {
+            rankedPassages.map { "Page ${it.pageNumber}" }.distinct()
+        } else {
+            pagesText.indices.take(4).map { "Page ${it + 1}" }
+        }
 
-        // Build grounded context from the PDF's cleaned pages (bounded to fit prompt cleanly)
+        // Build concise, grounded context from the PDF's cleaned pages and top sentence chunks
         val pdfContext = buildString {
             append("PDF File Name: ").append(file.name).append('\n')
             append("Total Pages: ").append(pagesText.size).append("\n\n")
             if (rankedPassages.isNotEmpty()) {
-                append("Most Relevant Passages:\n")
+                append("Top Matching Sentence Chunks:\n")
                 rankedPassages.forEach { passage ->
                     append("- [Page ").append(passage.pageNumber).append("] ").append(passage.snippet).append('\n')
                 }
                 append('\n')
             }
-            append("Full Cleaned Page Contents:\n")
-            pagesText.take(12).forEachIndexed { idx, pageText ->
+            append("Cleaned Page Contents:\n")
+            pagesText.take(6).forEachIndexed { idx, pageText ->
                 append("--- PAGE ").append(idx + 1).append(" ---\n")
-                append(pageText.take(2200)).append("\n\n")
+                append(pageText.take(1400)).append("\n\n")
             }
         }
 
         val prompt = """
-            You are a helpful document assistant inside File Radar. Answer the user's question accurately using ONLY the provided PDF document content below.
+            You are a helpful document assistant inside File Radar. Answer the user's question clearly and concisely using ONLY the provided PDF document content below.
             Cite specific page numbers (e.g., [Page 1], [Page 2]) when referencing facts, numbers, or dates.
-            If the answer is not in the document, state clearly what information is present instead.
+            Use clean bullet points for readability when summarizing.
 
             $pdfContext
 
@@ -186,7 +199,7 @@ class FirebaseAiLogicPdfChatRepository : PdfChatAiRepository {
         val accumulatedText = StringBuilder()
 
         return try {
-            withTimeout(60_000L) {
+            withTimeout(45_000L) {
                 model.generateContentStream(prompt).collect { chunk ->
                     val chunkText = chunk.text.orEmpty()
                     if (chunkText.isNotEmpty()) {
@@ -207,38 +220,118 @@ class FirebaseAiLogicPdfChatRepository : PdfChatAiRepository {
                     isError = false
                 )
             } else {
+                val unaryResponse = withTimeout(30_000L) {
+                    model.generateContent(prompt)
+                }
+                val unaryText = unaryResponse.text?.trim().orEmpty()
+                if (unaryText.isNotEmpty()) {
+                    PdfChatMessage(
+                        id = messageId,
+                        isUser = false,
+                        engine = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
+                        text = unaryText,
+                        pageCitations = citations,
+                        isSamplePlaceholder = false,
+                        isError = false
+                    )
+                } else {
+                    PdfChatMessage(
+                        id = messageId,
+                        isUser = false,
+                        engine = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
+                        text = "Model returned an empty response. Please try asking your question again.",
+                        pageCitations = citations,
+                        isError = true
+                    )
+                }
+            }
+        } catch (e: TimeoutCancellationException) {
+            Log.e(TAG, "Firebase AI PDF chat streaming timed out", e)
+            val partial = accumulatedText.toString().trim()
+            if (partial.isNotEmpty()) {
                 PdfChatMessage(
                     id = messageId,
                     isUser = false,
                     engine = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
-                    text = "Model returned an empty response. Please try asking your question again.",
+                    text = partial,
                     pageCitations = citations,
-                    isError = true
+                    isSamplePlaceholder = false,
+                    isError = false
                 )
+            } else {
+                try {
+                    val fallbackResponse = withTimeout(25_000L) {
+                        model.generateContent(prompt)
+                    }
+                    val fallbackText = fallbackResponse.text?.trim().orEmpty()
+                    if (fallbackText.isNotEmpty()) {
+                        PdfChatMessage(
+                            id = messageId,
+                            isUser = false,
+                            engine = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
+                            text = fallbackText,
+                            pageCitations = citations,
+                            isSamplePlaceholder = false,
+                            isError = false
+                        )
+                    } else {
+                        PdfChatMessage(
+                            id = messageId,
+                            isUser = false,
+                            engine = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
+                            text = "Generation timed out. Please try again or switch to Local Gemma E2B.",
+                            pageCitations = citations,
+                            isError = true
+                        )
+                    }
+                } catch (ce: CancellationException) {
+                    if (ce !is TimeoutCancellationException) throw ce
+                    PdfChatMessage(
+                        id = messageId,
+                        isUser = false,
+                        engine = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
+                        text = "Generation timed out after 60 seconds. Please try again or switch to Local Gemma E2B.",
+                        pageCitations = citations,
+                        isError = true
+                    )
+                } catch (inner: Exception) {
+                    Log.e(TAG, "Firebase AI unary fallback failed after timeout", inner)
+                    PdfChatMessage(
+                        id = messageId,
+                        isUser = false,
+                        engine = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
+                        text = inner.localizedMessage ?: "Generation timed out. Please try again or switch to Local Gemma E2B.",
+                        pageCitations = citations,
+                        isError = true
+                    )
+                }
             }
-        } catch (e: TimeoutCancellationException) {
-            Log.e(TAG, "Firebase AI PDF chat streaming timed out", e)
-            PdfChatMessage(
-                id = messageId,
-                isUser = false,
-                engine = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
-                text = "Generation timed out after 60 seconds. Please try again or switch to Local Gemma E2B.",
-                pageCitations = citations,
-                isError = true
-            )
         } catch (e: CancellationException) {
             // Always rethrow CancellationException to preserve cooperative coroutine cancellation
             throw e
         } catch (e: Exception) {
             Log.e(TAG, "Firebase AI PDF chat generation failed", e)
-            PdfChatMessage(
-                id = messageId,
-                isUser = false,
-                engine = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
-                text = e.localizedMessage ?: "Firebase AI generation failed.",
-                pageCitations = citations,
-                isError = true
-            )
+            val partial = accumulatedText.toString().trim()
+            if (partial.isNotEmpty()) {
+                PdfChatMessage(
+                    id = messageId,
+                    isUser = false,
+                    engine = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
+                    text = partial,
+                    pageCitations = citations,
+                    isSamplePlaceholder = false,
+                    isError = false
+                )
+            } else {
+                PdfChatMessage(
+                    id = messageId,
+                    isUser = false,
+                    engine = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
+                    text = e.localizedMessage ?: "Firebase AI generation failed.",
+                    pageCitations = citations,
+                    isError = true
+                )
+            }
         }
     }
 }
@@ -253,6 +346,7 @@ class PlaceholderGeminiSubscriptionRepository : PdfChatAiRepository {
         question: String,
         onStreamUpdate: ((String, List<String>) -> Unit)?
     ): PdfChatMessage = withContext(Dispatchers.Default) {
+        val extraction = buildExtractionResultFromRawPages(file, pagesText)
         val rankedPassages = retrieveRelevantPdfPassages(pagesText, question)
         val citations = rankedPassages.map { "Page ${it.pageNumber}" }.distinct()
         val topExcerpt = rankedPassages.joinToString("\n• ") {
@@ -264,8 +358,7 @@ class PlaceholderGeminiSubscriptionRepository : PdfChatAiRepository {
             if (topExcerpt.isNotBlank()) {
                 append("• ").append(topExcerpt).append("\n\n")
             }
-            append("Summary for \"$question\": ")
-            append(synthesizeDirectAnswerSummary(file, pagesText, rankedPassages, question))
+            append(synthesizeLocalGemmaResponse(file, extraction, rankedPassages, question))
         }
 
         PdfChatMessage(
@@ -282,36 +375,121 @@ class PlaceholderGeminiSubscriptionRepository : PdfChatAiRepository {
 internal data class PdfPassageMatch(
     val pageNumber: Int,
     val snippet: String,
-    val score: Double
+    val score: Double,
+    val source: ExtractionSource = ExtractionSource.PDF_TEXT
 )
 
+/**
+ * Generates an on-device Local Gemma E2B answer using sentence-aware [TextChunk]s and
+ * multi-signal BM25 + semantic intent synthesis over the hybrid-extracted PDF content.
+ */
 internal fun generateLocalGemmaE2bPdfAnswer(
     file: PhoneFileItem,
     pagesText: List<String>,
-    question: String
+    question: String,
+    extractionResult: DocumentExtractionResult? = null
 ): PdfChatMessage {
-    val rankedPassages = retrieveRelevantPdfPassages(pagesText, question)
-    val citations = rankedPassages.map { "Page ${it.pageNumber}" }.distinct()
-    val summary = synthesizeDirectAnswerSummary(file, pagesText, rankedPassages, question)
-
-    val formattedAnswer = buildString {
-        append(summary)
-        if (rankedPassages.isNotEmpty()) {
-            append("\n\nGrounded PDF Excerpts (On-Device RAG):\n")
-            rankedPassages.forEach { match ->
-                append("• [Page ${match.pageNumber}] ${match.snippet}\n")
+    val resolvedExtraction = extractionResult ?: buildExtractionResultFromRawPages(file, pagesText)
+    val rankedPassages = retrieveRelevantChunksAndPassages(resolvedExtraction, question)
+    val citations = if (rankedPassages.isNotEmpty()) {
+        rankedPassages.map { match ->
+            if (match.source == ExtractionSource.ML_KIT_OCR) {
+                "Page ${match.pageNumber} (OCR)"
+            } else {
+                "Page ${match.pageNumber}"
             }
-        }
-    }.trim()
+        }.distinct()
+    } else {
+        resolvedExtraction.pages.take(4).map { "Page ${it.pageNumber}" }
+    }
+
+    val synthesized = synthesizeLocalGemmaResponse(
+        file = file,
+        extraction = resolvedExtraction,
+        topPassages = rankedPassages,
+        question = question
+    )
 
     return PdfChatMessage(
         id = "gemma_${System.currentTimeMillis()}",
         isUser = false,
         engine = PdfChatEngineOption.LOCAL_GEMMA_E2B,
-        text = formattedAnswer,
+        text = synthesized,
         pageCitations = citations,
         isSamplePlaceholder = false
     )
+}
+
+private fun buildExtractionResultFromRawPages(
+    file: PhoneFileItem,
+    pagesText: List<String>
+): DocumentExtractionResult {
+    val docUri = runCatching { Uri.parse("file://${file.fullPath}") }.getOrElse { Uri.EMPTY }
+    val extractedPages = pagesText.mapIndexed { idx, rawPage ->
+        val normalized = TextNormalizer.normalize(rawPage)
+        ExtractedPage(
+            pageNumber = idx + 1,
+            rawText = rawPage,
+            normalizedText = normalized,
+            source = ExtractionSource.PDF_TEXT
+        )
+    }
+    val chunks = TextChunker.chunkPages(
+        documentUri = docUri,
+        pages = extractedPages,
+        maxChunkChars = 800,
+        overlapChars = 100
+    )
+    return DocumentExtractionResult(
+        documentUri = docUri,
+        totalPages = extractedPages.size,
+        pages = extractedPages,
+        chunks = chunks
+    )
+}
+
+private val ragStopWords = setOf(
+    "the", "and", "for", "with", "that", "this", "from", "what", "when", "where",
+    "which", "who", "how", "are", "was", "were", "does", "did", "can", "you",
+    "tell", "about", "into", "pdf", "document", "file", "page", "pages", "please",
+    "give", "show", "find", "list", "all", "any", "have", "has", "had", "been",
+    "would", "could", "should", "there", "their", "they", "them", "these", "those"
+)
+
+private val domainSynonymGroups: List<Set<String>> = listOf(
+    setOf("total", "amount", "balance", "cost", "price", "fee", "sum", "paid", "payment", "invoice", "charge", "expense", "credit", "debit"),
+    setOf("date", "when", "time", "day", "month", "year", "period", "schedule", "deadline", "timestamp"),
+    setOf("summary", "summarize", "overview", "abstract", "synopsis", "main", "purpose", "topic", "subject", "about"),
+    setOf("finding", "findings", "result", "results", "conclusion", "conclusions", "outcome", "value", "values", "impression", "diagnosis", "status"),
+    setOf("number", "numbers", "figure", "figures", "metric", "metrics", "statistic", "statistics", "count", "rate", "percentage", "level", "range"),
+    setOf("author", "who", "person", "patient", "client", "customer", "company", "organization", "vendor", "provider", "name")
+)
+
+private fun expandQueryTerms(queryTokens: List<String>): Set<String> {
+    val expanded = mutableSetOf<String>()
+    for (token in queryTokens) {
+        expanded.add(token)
+        if (token.length >= 5) {
+            expanded.add(token.take(token.length - 1))
+        }
+        for (group in domainSynonymGroups) {
+            if (token in group) {
+                expanded.addAll(group)
+            }
+        }
+    }
+    return expanded
+}
+
+private fun isBoilerplateMetadataLine(line: String): Boolean {
+    val trimmed = line.trim()
+    return trimmed.startsWith("DOCUMENT METADATA", ignoreCase = true) ||
+        trimmed.startsWith("• File Name:", ignoreCase = true) ||
+        trimmed.startsWith("• Storage Path:", ignoreCase = true) ||
+        trimmed.startsWith("• Volume:", ignoreCase = true) ||
+        trimmed.startsWith("• File Size:", ignoreCase = true) ||
+        trimmed.startsWith("• Last Modified:", ignoreCase = true) ||
+        trimmed.matches(Regex("^Page\\s+\\d+(\\s+of\\s+\\d+)?$", RegexOption.IGNORE_CASE))
 }
 
 internal fun retrieveRelevantPdfPassages(
@@ -319,103 +497,529 @@ internal fun retrieveRelevantPdfPassages(
     question: String
 ): List<PdfPassageMatch> {
     if (pagesText.isEmpty()) return emptyList()
-
-    val stopWords = setOf(
-        "the", "and", "for", "with", "that", "this", "from", "what", "when", "where",
-        "which", "who", "how", "are", "was", "were", "does", "did", "can", "you",
-        "tell", "about", "into", "pdf", "document", "file", "page", "pages", "please"
+    val dummyUri = Uri.EMPTY
+    val pages = pagesText.mapIndexed { index, text ->
+        ExtractedPage(
+            pageNumber = index + 1,
+            rawText = text,
+            normalizedText = TextNormalizer.normalize(text),
+            source = ExtractionSource.PDF_TEXT
+        )
+    }
+    val chunks = TextChunker.chunkPages(dummyUri, pages, maxChunkChars = 800, overlapChars = 100)
+    val extraction = DocumentExtractionResult(
+        documentUri = dummyUri,
+        totalPages = pages.size,
+        pages = pages,
+        chunks = chunks
     )
-    val queryTokens = question.lowercase(Locale.ROOT)
-        .split(Regex("[^a-z0-9]+"))
-        .filter { it.length >= 2 && it !in stopWords }
+    return retrieveRelevantChunksAndPassages(extraction, question)
+}
+
+/**
+ * Multi-signal BM25 + semantic intent retrieval over sentence-aware [TextChunk]s and sentences.
+ */
+internal fun retrieveRelevantChunksAndPassages(
+    extraction: DocumentExtractionResult,
+    question: String
+): List<PdfPassageMatch> {
+    if (extraction.pages.isEmpty()) return emptyList()
 
     val lowerQ = question.lowercase(Locale.ROOT)
+    val queryTokens = lowerQ
+        .split(Regex("[^a-z0-9.%$]+"))
+        .map { it.trim('.', ',', '$', '%') }
+        .filter { it.length >= 2 && it !in ragStopWords }
+        .distinct()
+
+    val expandedTerms = expandQueryTerms(queryTokens)
+
     val wantsNumbers = lowerQ.contains("number") || lowerQ.contains("amount") ||
         lowerQ.contains("total") || lowerQ.contains("balance") ||
         lowerQ.contains("price") || lowerQ.contains("cost") ||
-        lowerQ.contains("date") || lowerQ.contains("value") || lowerQ.contains("count")
+        lowerQ.contains("value") || lowerQ.contains("count") ||
+        lowerQ.contains("how much") || lowerQ.contains("how many") ||
+        lowerQ.contains("rate") || lowerQ.contains("level") || lowerQ.contains("score")
 
-    val candidates = mutableListOf<PdfPassageMatch>()
+    val wantsDates = lowerQ.contains("date") || lowerQ.contains("when") ||
+        lowerQ.contains("year") || lowerQ.contains("month") || lowerQ.contains("day") ||
+        lowerQ.contains("time")
 
-    pagesText.forEachIndexed { index, pageContent ->
-        val pageNum = index + 1
-        val paragraphs = pageContent
+    val wantsFindings = lowerQ.contains("finding") || lowerQ.contains("result") ||
+        lowerQ.contains("conclusion") || lowerQ.contains("main") ||
+        lowerQ.contains("key") || lowerQ.contains("important") || lowerQ.contains("summary")
+
+    // Collect candidate sentences from sentence-aware chunks across all pages
+    data class CandidateSentence(
+        val pageNumber: Int,
+        val text: String,
+        val tokens: List<String>,
+        val source: ExtractionSource
+    )
+
+    val allCandidates = mutableListOf<CandidateSentence>()
+    for (page in extraction.pages) {
+        val cleanPageLines = page.normalizedText
             .lines()
             .map { it.trim() }
-            .filter { it.length >= 6 && !it.startsWith("• Storage Path:") }
+            .filter { it.length >= 8 && !isBoilerplateMetadataLine(it) }
 
-        for (line in paragraphs) {
-            val lowerLine = line.lowercase(Locale.ROOT)
-            var score = 0.15
-
-            for (token in queryTokens) {
-                if (lowerLine.contains(token)) {
-                    score += if (lowerLine.split(Regex("[^a-z0-9]+")).contains(token)) 2.4 else 1.2
+        val cleanedPageBody = cleanPageLines.joinToString("\n")
+        val sentences = TextChunker.splitIntoSentences(cleanedPageBody)
+            .flatMap { sent ->
+                // If a sentence block contains multiple bullet lines, also evaluate individual informative lines
+                if (sent.contains('\n') && sent.length > 180) {
+                    sent.lines().map { it.trim() }.filter { it.length >= 12 }
+                } else {
+                    listOf(sent.replace('\n', ' ').trim())
                 }
             }
+            .filter { it.length >= 10 && !isBoilerplateMetadataLine(it) }
 
-            if (wantsNumbers && line.any { it.isDigit() }) {
-                score += 1.1
-            }
-
-            if (line.contains(':') || line.startsWith("•")) {
-                score += 0.25
-            }
-
-            candidates.add(
-                PdfPassageMatch(
-                    pageNumber = pageNum,
-                    snippet = line.take(220),
-                    score = score
+        for (sent in sentences) {
+            val sentTokens = sent.lowercase(Locale.ROOT)
+                .split(Regex("[^a-z0-9]+"))
+                .filter { it.length >= 2 }
+            if (sentTokens.isNotEmpty()) {
+                allCandidates.add(
+                    CandidateSentence(
+                        pageNumber = page.pageNumber,
+                        text = sent,
+                        tokens = sentTokens,
+                        source = page.source
+                    )
                 )
-            )
+            }
         }
     }
 
-    return candidates
+    if (allCandidates.isEmpty()) return emptyList()
+
+    // Compute inverse document frequency (IDF) across candidate sentences
+    val totalDocs = allCandidates.size.coerceAtLeast(1)
+    val docFreq = mutableMapOf<String, Int>()
+    for (candidate in allCandidates) {
+        for (uniqueToken in candidate.tokens.toSet()) {
+            docFreq[uniqueToken] = (docFreq[uniqueToken] ?: 0) + 1
+        }
+    }
+
+    fun idf(term: String): Double {
+        val df = docFreq[term] ?: 0
+        return ln(1.0 + (totalDocs - df + 0.5) / (df + 0.5))
+    }
+
+    val scoredMatches = allCandidates.mapIndexed { idx, candidate ->
+        val lowerSent = candidate.text.lowercase(Locale.ROOT)
+        val tokenSet = candidate.tokens.toSet()
+        var score = 0.0
+
+        // 1. Exact & Stem Query Token Matches (weighted by IDF)
+        var exactQueryHits = 0
+        for (qToken in queryTokens) {
+            val weight = idf(qToken).coerceAtLeast(0.8)
+            when {
+                qToken in tokenSet -> {
+                    score += 3.2 * weight
+                    exactQueryHits++
+                }
+                qToken.length >= 4 && tokenSet.any { it.startsWith(qToken.take(4)) || qToken.startsWith(it.take(4)) } -> {
+                    score += 2.0 * weight
+                    exactQueryHits++
+                }
+                lowerSent.contains(qToken) -> {
+                    score += 1.4 * weight
+                    exactQueryHits++
+                }
+            }
+        }
+
+        // Phrase / Multi-word query match bonus
+        if (exactQueryHits >= 2) {
+            score += exactQueryHits * 1.8
+        }
+
+        // 2. Domain Synonym Expansion Matches
+        for (syn in expandedTerms) {
+            if (syn !in queryTokens && syn in tokenSet) {
+                score += 0.85 * idf(syn).coerceAtLeast(0.5)
+            }
+        }
+
+        // 3. Quantitative / Date / Finding Intent Alignment
+        val hasDigits = candidate.text.any { it.isDigit() }
+        val hasCurrencyOrPercent = candidate.text.any { it == '$' || it == '%' || it == '€' || it == '£' || it == '₹' }
+        val hasDatePattern = Regex("\\b(\\d{1,4}[/-]\\d{1,2}[/-]\\d{1,4}|20\\d{2}|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\\b", RegexOption.IGNORE_CASE)
+            .containsMatchIn(candidate.text)
+
+        if (wantsNumbers && hasDigits) {
+            score += if (hasCurrencyOrPercent) 2.4 else 1.5
+        }
+        if (wantsDates && (hasDatePattern || hasDigits)) {
+            score += if (hasDatePattern) 2.3 else 0.9
+        }
+        if (wantsFindings && (hasDigits || candidate.tokens.size in 7..35)) {
+            score += 0.9
+        }
+
+        // 4. Information Density & Sentence Quality Score (reward real multi-word sentences over isolated ALL-CAPS headers)
+        val wordCount = candidate.tokens.size
+        val isAllCapsHeader = candidate.text.count { it.isUpperCase() }.toFloat() /
+            candidate.text.count { it.isLetter() }.coerceAtLeast(1).toFloat() > 0.78f
+        if (wordCount in 6..42 && !isAllCapsHeader) {
+            score += 0.65
+        } else if (isAllCapsHeader && exactQueryHits == 0) {
+            score -= 0.5
+        }
+
+        if (hasDigits) {
+            score += 0.35
+        }
+
+        // Tiny positional tie-breaker so earlier substantive sentences win only when scores are truly equal
+        score += (1.0 / (idx + 10.0)) * 0.05
+
+        PdfPassageMatch(
+            pageNumber = candidate.pageNumber,
+            snippet = candidate.text.take(360),
+            score = score,
+            source = candidate.source
+        )
+    }
+
+    return scoredMatches
         .sortedByDescending { it.score }
         .distinctBy { it.snippet.lowercase(Locale.ROOT) }
-        .take(4)
+        .take(5)
 }
 
-private fun synthesizeDirectAnswerSummary(
+/**
+ * Extractive TextRank / Centroid + Intent-Aware Synthesizer for Local Gemma E2B.
+ * Produces rich, multi-paragraph, page-cited answers grounded in the extracted PDF chunks.
+ */
+private fun synthesizeLocalGemmaResponse(
     file: PhoneFileItem,
-    pagesText: List<String>,
+    extraction: DocumentExtractionResult,
     topPassages: List<PdfPassageMatch>,
     question: String
 ): String {
     val lowerQ = question.lowercase(Locale.ROOT)
-    val totalPages = pagesText.size.coerceAtLeast(1)
+    val pages = extraction.pages
+    val totalPages = pages.size.coerceAtLeast(1)
+    val ocrPageCount = pages.count { it.source == ExtractionSource.ML_KIT_OCR }
+    val digitalPageCount = pages.count { it.source == ExtractionSource.PDF_TEXT }
 
-    if (lowerQ.contains("summarize") || lowerQ.contains("summary") || lowerQ.contains("overview")) {
-        val pagePreviews = pagesText.mapIndexed { idx, content ->
-            val cleanLines = content.lines()
-                .map { it.trim() }
-                .filter { it.length >= 10 && !it.startsWith("DOCUMENT METADATA") && !it.startsWith("• File Name:") }
-                .take(2)
-                .joinToString(" ")
-            "Page ${idx + 1}: ${cleanLines.ifBlank { "Contains structured document records." }}"
+    val provenanceSummary = when {
+        ocrPageCount > 0 && digitalPageCount > 0 ->
+            "$totalPages pages ($digitalPageCount digital text + $ocrPageCount ML Kit OCR)"
+        ocrPageCount > 0 ->
+            "$totalPages ${if (totalPages == 1) "page" else "pages"} (extracted via on-device ML Kit OCR)"
+        else ->
+            "$totalPages ${if (totalPages == 1) "page" else "pages"} (extracted via PDFBox digital text layer)"
+    }
+
+    val isSummaryQuery = lowerQ.contains("summarize") || lowerQ.contains("summary") ||
+        lowerQ.contains("overview") || lowerQ.contains("what is this") ||
+        lowerQ.contains("about") || lowerQ.contains("tl;dr") || lowerQ.contains("main points")
+
+    val isNumbersOrDatesQuery = lowerQ.contains("key numbers") || lowerQ.contains("dates & totals") ||
+        lowerQ.contains("numbers, dates") || lowerQ.contains("all numbers") ||
+        lowerQ.contains("amounts") || lowerQ.contains("figures")
+
+    val isFindingsQuery = lowerQ.contains("main findings") || lowerQ.contains("findings & values") ||
+        lowerQ.contains("key findings") || lowerQ.contains("conclusions") ||
+        lowerQ.contains("takeaways")
+
+    val isPageOutlineQuery = lowerQ.contains("list all pages") || lowerQ.contains("pages & sections") ||
+        lowerQ.contains("table of contents") || lowerQ.contains("sections")
+
+    // 1. Executive Document Summary Mode
+    if (isSummaryQuery) {
+        val topTopics = extractTopDocumentKeyphrases(extraction, limit = 6)
+        val salientSentences = extractSalientSummarySentences(extraction, maxSentences = 5)
+        val keyMetrics = extractQuantitativeFacts(extraction, maxFacts = 5)
+
+        return buildString {
+            append("Executive Summary — ${file.name}\n")
+            append("• Scope: $provenanceSummary • ${extraction.chunks.size} indexed sentence chunks.\n")
+            if (topTopics.isNotEmpty()) {
+                append("• Core Topics: ${topTopics.joinToString(", ")}\n")
+            }
+            append('\n')
+
+            if (salientSentences.isNotEmpty()) {
+                append("Key Highlights & Takeaways:\n")
+                salientSentences.forEach { (pageNum, sentence) ->
+                    append("• [Page $pageNum] $sentence\n")
+                }
+                append('\n')
+            }
+
+            if (keyMetrics.isNotEmpty()) {
+                append("Notable Figures, Dates & Measurements:\n")
+                keyMetrics.forEach { (pageNum, fact) ->
+                    append("• [Page $pageNum] $fact\n")
+                }
+                append('\n')
+            }
+
+            append("Page-by-Page Breakdown:\n")
+            pages.take(8).forEach { page ->
+                val pageDigest = summarizeSinglePage(page)
+                val badge = if (page.source == ExtractionSource.ML_KIT_OCR) " [OCR]" else ""
+                append("• Page ${page.pageNumber}$badge: $pageDigest\n")
+            }
+        }.trim()
+    }
+
+    // 2. Key Numbers, Dates & Totals Mode
+    if (isNumbersOrDatesQuery) {
+        val quantFacts = extractQuantitativeFacts(extraction, maxFacts = 10)
+        return buildString {
+            append("Key Numbers, Dates & Totals in ${file.name} ($provenanceSummary):\n\n")
+            if (quantFacts.isNotEmpty()) {
+                quantFacts.forEach { (pageNum, fact) ->
+                    append("• [Page $pageNum] $fact\n")
+                }
+            } else if (topPassages.isNotEmpty()) {
+                topPassages.forEach { match ->
+                    append("• [Page ${match.pageNumber}] ${match.snippet}\n")
+                }
+            } else {
+                append("No explicit numerical totals, currency amounts, or dates were detected in the extracted text of ${file.name}.")
+            }
+        }.trim()
+    }
+
+    // 3. Main Findings & Values Mode
+    if (isFindingsQuery) {
+        val salient = extractSalientSummarySentences(extraction, maxSentences = 6)
+        val quantFacts = extractQuantitativeFacts(extraction, maxFacts = 4)
+        return buildString {
+            append("Main Findings & Values — ${file.name} ($provenanceSummary):\n\n")
+            if (salient.isNotEmpty()) {
+                salient.forEach { (pageNum, sentence) ->
+                    append("• [Page $pageNum] $sentence\n")
+                }
+            }
+            if (quantFacts.isNotEmpty()) {
+                append("\nKey Recorded Values:\n")
+                quantFacts.forEach { (pageNum, fact) ->
+                    append("• [Page $pageNum] $fact\n")
+                }
+            }
+        }.trim()
+    }
+
+    // 4. Page & Section Outline Mode
+    if (isPageOutlineQuery) {
+        return buildString {
+            append("Pages & Sections Outline — ${file.name} ($provenanceSummary):\n\n")
+            pages.forEach { page ->
+                val sourceTag = if (page.source == ExtractionSource.ML_KIT_OCR) "On-Device OCR" else "Digital Text"
+                val heading = extractPageHeadingOrTitle(page)
+                val digest = summarizeSinglePage(page)
+                append("• Page ${page.pageNumber} ($sourceTag) — $heading\n")
+                if (digest.isNotBlank() && !digest.equals(heading, ignoreCase = true)) {
+                    append("  $digest\n")
+                }
+            }
+        }.trim()
+    }
+
+    // 5. Focused Question Answering over Top Ranked Sentence Chunks
+    val bestMatches = topPassages.filter { it.score > 0.35 }.ifEmpty { topPassages.take(3) }
+    return if (bestMatches.isNotEmpty()) {
+        val primary = bestMatches.first()
+        val supporting = bestMatches.drop(1).take(3)
+
+        // Also locate the surrounding 800-char TextChunk for richer paragraph context
+        val matchingChunk = extraction.chunks.firstOrNull { chunk ->
+            chunk.pageNumber == primary.pageNumber &&
+                chunk.text.contains(primary.snippet.take(40), ignoreCase = true)
         }
-        return "Document Summary for ${file.name} ($totalPages ${if (totalPages == 1) "page" else "pages"}):\n" +
-            pagePreviews.joinToString("\n")
-    }
 
-    if (lowerQ.contains("list all pages") || lowerQ.contains("sections")) {
-        return pagesText.mapIndexed { idx, content ->
-            val firstHeading = content.lines()
-                .map { it.trim() }
-                .firstOrNull { it.length >= 5 && !it.startsWith("DOCUMENT METADATA") && !it.startsWith("•") }
-                ?: "Page ${idx + 1} Content"
-            "Page ${idx + 1}: $firstHeading"
-        }.joinToString("\n")
-    }
+        buildString {
+            append("Direct Answer (Page ${primary.pageNumber} • ${primary.source.badgeLabel}):\n")
+            append(primary.snippet)
+            if (!primary.snippet.endsWith('.') && !primary.snippet.endsWith('!') && !primary.snippet.endsWith('?')) {
+                append('.')
+            }
 
-    val best = topPassages.firstOrNull()
-    return if (best != null) {
-        "On Page ${best.pageNumber} of ${file.name}, the document states: \"${best.snippet}\"."
+            if (supporting.isNotEmpty()) {
+                append("\n\nRelated Findings Across Document:\n")
+                supporting.forEach { match ->
+                    append("• [Page ${match.pageNumber}] ${match.snippet}\n")
+                }
+            }
+
+            if (matchingChunk != null && matchingChunk.text.length > primary.snippet.length + 40) {
+                append("\nSupporting Paragraph Context (Page ${matchingChunk.pageNumber}, Chunk #${matchingChunk.chunkIndex + 1}):\n")
+                append(matchingChunk.text.take(460))
+            }
+        }.trim()
     } else {
-        "Analyzed $totalPages ${if (totalPages == 1) "page" else "pages"} of ${file.name} (${file.formattedSize()}). Ask about specific terms, numbers, dates, or sections to retrieve exact page citations."
+        val fallbackSummary = extractSalientSummarySentences(extraction, maxSentences = 3)
+        buildString {
+            append("No exact phrase match for \"$question\" was found in ${file.name} ($provenanceSummary).\n\n")
+            if (fallbackSummary.isNotEmpty()) {
+                append("Closest Key Statements in Document:\n")
+                fallbackSummary.forEach { (pageNum, sentence) ->
+                    append("• [Page $pageNum] $sentence\n")
+                }
+            }
+        }.trim()
     }
+}
+
+/**
+ * Computes the top substantive keyphrases/terms across all extracted pages using TF-IDF frequency.
+ */
+private fun extractTopDocumentKeyphrases(
+    extraction: DocumentExtractionResult,
+    limit: Int
+): List<String> {
+    val freq = mutableMapOf<String, Int>()
+    for (page in extraction.pages) {
+        val lines = page.normalizedText.lines().filter { !isBoilerplateMetadataLine(it) }
+        for (line in lines) {
+            val words = line.lowercase(Locale.ROOT)
+                .split(Regex("[^a-z]+"))
+                .filter { it.length in 4..20 && it !in ragStopWords }
+            for (w in words) {
+                freq[w] = (freq[w] ?: 0) + 1
+            }
+        }
+    }
+    return freq.entries
+        .sortedByDescending { it.value }
+        .take(limit)
+        .map { entry ->
+            entry.key.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
+        }
+}
+
+/**
+ * Extractive TextRank / Centroid sentence selector that chooses the most informative,
+ * high-centrality sentences across the PDF while skipping headers, footers, and metadata boilerplate.
+ */
+private fun extractSalientSummarySentences(
+    extraction: DocumentExtractionResult,
+    maxSentences: Int
+): List<Pair<Int, String>> {
+    val wordFreq = mutableMapOf<String, Int>()
+    val candidates = mutableListOf<Pair<Int, String>>()
+
+    for (page in extraction.pages) {
+        val cleanBody = page.normalizedText
+            .lines()
+            .map { it.trim() }
+            .filter { it.length >= 12 && !isBoilerplateMetadataLine(it) }
+            .joinToString("\n")
+
+        val sentences = TextChunker.splitIntoSentences(cleanBody)
+            .flatMap { block ->
+                if (block.contains('\n') && block.length > 160) {
+                    block.lines().map { it.trim() }
+                } else {
+                    listOf(block.replace('\n', ' ').trim())
+                }
+            }
+            .filter { it.length in 24..300 && !isBoilerplateMetadataLine(it) }
+
+        for (sentence in sentences) {
+            val words = sentence.lowercase(Locale.ROOT)
+                .split(Regex("[^a-z0-9]+"))
+                .filter { it.length >= 3 && it !in ragStopWords }
+            if (words.size >= 4) {
+                candidates.add(page.pageNumber to sentence)
+                for (w in words) {
+                    wordFreq[w] = (wordFreq[w] ?: 0) + 1
+                }
+            }
+        }
+    }
+
+    if (candidates.isEmpty()) return emptyList()
+
+    val scored = candidates.map { (pageNum, sentence) ->
+        val words = sentence.lowercase(Locale.ROOT)
+            .split(Regex("[^a-z0-9]+"))
+            .filter { it.length >= 3 && it !in ragStopWords }
+        val centroidScore = words.sumOf { wordFreq[it] ?: 1 }.toDouble() / (words.size.toDouble() + 2.0)
+        val hasDigits = if (sentence.any { it.isDigit() }) 1.35 else 1.0
+        val isAllCaps = sentence.count { it.isUpperCase() }.toFloat() /
+            sentence.count { it.isLetter() }.coerceAtLeast(1).toFloat() > 0.75f
+        val penalty = if (isAllCaps) 0.55 else 1.0
+        Triple(pageNum, sentence, centroidScore * hasDigits * penalty)
+    }
+
+    val selected = mutableListOf<Pair<Int, String>>()
+    val seenNormalized = mutableSetOf<String>()
+
+    for ((pageNum, sentence, _) in scored.sortedByDescending { it.third }) {
+        val normKey = sentence.lowercase(Locale.ROOT).take(45)
+        if (seenNormalized.add(normKey)) {
+            selected.add(pageNum to sentence)
+            if (selected.size >= maxSentences) break
+        }
+    }
+
+    return selected.sortedBy { it.first }
+}
+
+/**
+ * Extracts quantitative lines/sentences containing currency figures, percentages, dates,
+ * reference ranges, or key-value metrics across all pages.
+ */
+private fun extractQuantitativeFacts(
+    extraction: DocumentExtractionResult,
+    maxFacts: Int
+): List<Pair<Int, String>> {
+    val facts = mutableListOf<Pair<Int, String>>()
+    val seen = mutableSetOf<String>()
+    val metricRegex = Regex(
+        "(\\$[0-9,]+(\\.[0-9]{2})?|\\b\\d+(\\.\\d+)?\\s*(%|mg/dL|g/dL|mIU/L|U/L|uL|mL/min|MB|GB|KB|days|months|years|USD|EUR|INR)\\b|\\b\\d{1,2}[/-]\\d{1,2}[/-]\\d{2,4}\\b|\\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\\s+\\d{1,2}\\b)",
+        RegexOption.IGNORE_CASE
+    )
+
+    for (page in extraction.pages) {
+        val lines = page.normalizedText
+            .lines()
+            .map { it.trim().trimStart('•', '-', '*').trim() }
+            .filter { it.length in 10..240 && !isBoilerplateMetadataLine(it) }
+
+        for (line in lines) {
+            if (metricRegex.containsMatchIn(line) || (line.contains(':') && line.any { it.isDigit() })) {
+                val key = line.lowercase(Locale.ROOT)
+                if (seen.add(key)) {
+                    facts.add(page.pageNumber to line)
+                    if (facts.size >= maxFacts) return facts
+                }
+            }
+        }
+    }
+    return facts
+}
+
+private fun extractPageHeadingOrTitle(page: ExtractedPage): String {
+    val lines = page.normalizedText
+        .lines()
+        .map { it.trim() }
+        .filter { it.length >= 5 && !isBoilerplateMetadataLine(it) }
+    return lines.firstOrNull { line ->
+        !line.startsWith("•") && line.length <= 90
+    } ?: lines.firstOrNull()?.take(80) ?: "Page ${page.pageNumber} Content"
+}
+
+private fun summarizeSinglePage(page: ExtractedPage): String {
+    val lines = page.normalizedText
+        .lines()
+        .map { it.trim().trimStart('•').trim() }
+        .filter { it.length >= 12 && !isBoilerplateMetadataLine(it) }
+    if (lines.isEmpty()) return "No readable text found on this page."
+    val bodyLines = if (lines.size > 1 && lines[0].length < 75) lines.drop(1) else lines
+    return bodyLines.take(2).joinToString(" • ").take(240)
 }
 
 @Composable
@@ -429,27 +1033,64 @@ fun FullScreenPdfChatDialog(
     val focusManager = LocalFocusManager.current
     val coroutineScope = rememberCoroutineScope()
     val listState = rememberLazyListState()
+    val hybridExtractor = remember(context) { HybridPdfExtractor(context.applicationContext) }
 
     var selectedEngine by remember(file.id) { mutableStateOf(PdfChatEngineOption.LOCAL_GEMMA_E2B) }
+    var extractionResult by remember(file.id) { mutableStateOf<DocumentExtractionResult?>(null) }
     var extractedPages by remember(file.id) { mutableStateOf<List<String>>(emptyList()) }
     var isIndexingPdf by remember(file.id) { mutableStateOf(true) }
+    var indexingProgressLabel by remember(file.id) {
+        mutableStateOf("Running Hybrid PDF Extractor (PDFBox + ML Kit OCR)…")
+    }
     var isGeneratingReply by remember(file.id) { mutableStateOf(false) }
     var questionInput by remember(file.id) { mutableStateOf("") }
     var messages by remember(file.id) { mutableStateOf<List<PdfChatMessage>>(emptyList()) }
 
+    DisposableEffect(file.id) {
+        onDispose {
+            hybridExtractor.close()
+        }
+    }
+
     LaunchedEffect(file.id) {
         isIndexingPdf = true
-        val pages = withContext(Dispatchers.IO) {
-            extractReadablePagesFromPdf(context, file, expectedPageCount = 3)
+        val result = withContext(Dispatchers.IO) {
+            hybridExtractor.extractForPhoneFile(
+                file = file,
+                onPageProgress = { current, total ->
+                    indexingProgressLabel =
+                        "Extracting Page $current of $total (PDFBox Digital + ML Kit OCR)…"
+                }
+            )
         }
+        extractionResult = result
+        val pages = result.pages.map { it.normalizedText }
         extractedPages = pages
+
+        val ocrCount = result.pages.count { it.source == ExtractionSource.ML_KIT_OCR }
+        val digitalCount = result.pages.count { it.source == ExtractionSource.PDF_TEXT }
+        val sourceSummary = when {
+            ocrCount > 0 && digitalCount > 0 ->
+                "$digitalCount digital text pages + $ocrCount ML Kit OCR pages"
+            ocrCount > 0 ->
+                "$ocrCount pages via on-device ML Kit OCR"
+            else ->
+                "${pages.size} pages via PDFBox digital text layer"
+        }
+
         val welcomeMsg = PdfChatMessage(
             id = "welcome_${file.id}",
             isUser = false,
             engine = PdfChatEngineOption.LOCAL_GEMMA_E2B,
-            text = "Extracted and cleaned ${pages.size} ${if (pages.size == 1) "page" else "pages"} from ${file.name}. " +
-                "Enter your question in the query box above or tap a quick prompt to get answers grounded in this PDF.",
-            pageCitations = pages.indices.map { "Page ${it + 1}" }
+            text = "Hybrid PDF Extraction complete for ${file.name}: extracted $sourceSummary into ${result.chunks.size} sentence-aware chunks. " +
+                "Ask a question in the box above or tap a quick prompt below.",
+            pageCitations = result.pages.take(6).map { page ->
+                if (page.source == ExtractionSource.ML_KIT_OCR) {
+                    "Page ${page.pageNumber} (OCR)"
+                } else {
+                    "Page ${page.pageNumber}"
+                }
+            }
         )
         if (messages.isEmpty()) {
             messages = listOf(welcomeMsg)
@@ -462,29 +1103,50 @@ fun FullScreenPdfChatDialog(
         if (trimmed.isNotEmpty() && !isGeneratingReply) {
             focusManager.clearFocus()
             val activeEngine = selectedEngine
+            val now = System.currentTimeMillis()
             val userMessage = PdfChatMessage(
-                id = "user_${System.currentTimeMillis()}",
+                id = "user_$now",
                 isUser = true,
                 engine = activeEngine,
                 text = trimmed
             )
-            val streamingId = "stream_${System.currentTimeMillis()}"
-            messages = messages + userMessage
+            val streamingId = "stream_$now"
+            val initialPendingMessage = PdfChatMessage(
+                id = streamingId,
+                isUser = false,
+                engine = activeEngine,
+                text = if (activeEngine == PdfChatEngineOption.LOCAL_GEMMA_E2B) {
+                    "Running Local Gemma E2B RAG over sentence-aware PDF chunks…"
+                } else {
+                    "Connecting to Gemini 3.8 Flash (Keyless Free Tier) and analyzing PDF chunks…"
+                },
+                isStreaming = true
+            )
+            messages = messages + userMessage + initialPendingMessage
             questionInput = ""
             isGeneratingReply = true
 
             coroutineScope.launch {
-                val pagesForQuery = if (extractedPages.isNotEmpty()) {
-                    extractedPages
-                } else {
-                    withContext(Dispatchers.IO) {
-                        extractReadablePagesFromPdf(context, file, expectedPageCount = 3)
-                    }.also { extractedPages = it }
+                val targetIndex = (messages.size).coerceAtLeast(1)
+                runCatching { listState.animateScrollToItem(targetIndex) }
+
+                val currentExtraction = extractionResult ?: withContext(Dispatchers.IO) {
+                    hybridExtractor.extractForPhoneFile(file)
+                }.also {
+                    extractionResult = it
+                    extractedPages = it.pages.map { p -> p.normalizedText }
                 }
+                val pagesForQuery = currentExtraction.pages.map { it.normalizedText }
+
                 val reply = when (activeEngine) {
                     PdfChatEngineOption.LOCAL_GEMMA_E2B -> {
                         withContext(Dispatchers.Default) {
-                            generateLocalGemmaE2bPdfAnswer(file, pagesForQuery, trimmed)
+                            generateLocalGemmaE2bPdfAnswer(
+                                file = file,
+                                pagesText = pagesForQuery,
+                                question = trimmed,
+                                extractionResult = currentExtraction
+                            )
                         }
                     }
                     PdfChatEngineOption.GEMINI_SUBSCRIPTION -> {
@@ -509,9 +1171,8 @@ fun FullScreenPdfChatDialog(
                 }
                 messages = messages.filterNot { it.id == streamingId } + reply
                 isGeneratingReply = false
-                if (messages.isNotEmpty()) {
-                    listState.animateScrollToItem(messages.lastIndex)
-                }
+                val answerItemIndex = (messages.size).coerceAtLeast(1)
+                runCatching { listState.animateScrollToItem(answerItemIndex) }
             }
         }
     }
@@ -543,14 +1204,13 @@ fun FullScreenPdfChatDialog(
                         .fillMaxSize()
                         .widthIn(max = 760.dp)
                 ) {
-                    // Top Header + Model Selector + Prominent Query Input Box
+                    // Pinned Compact Top Bar ONLY (~52dp) so the rest of the screen scrolls freely
                     Surface(
                         color = MaterialTheme.colorScheme.surface,
                         tonalElevation = 3.dp,
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Column(modifier = Modifier.fillMaxWidth()) {
-                            // 1. Compact Header Row
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -587,8 +1247,9 @@ fun FullScreenPdfChatDialog(
                                             maxLines = 1,
                                             overflow = TextOverflow.Ellipsis
                                         )
+                                        val chunkCount = extractionResult?.chunks?.size ?: 0
                                         Text(
-                                            text = "${file.name} • ${extractedPages.size.coerceAtLeast(1)} ${if (extractedPages.size == 1) "page" else "pages"} indexed",
+                                            text = "${file.name} • ${extractedPages.size.coerceAtLeast(1)} ${if (extractedPages.size == 1) "page" else "pages"} • $chunkCount chunks",
                                             style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                                             maxLines = 1,
@@ -631,249 +1292,265 @@ fun FullScreenPdfChatDialog(
                             }
 
                             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                        }
+                    }
 
-                            // 2. Dual Chat Engine Selector: Local Gemma E2B vs Keyless Gemini (Firebase AI Logic)
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 14.dp, vertical = 8.dp)
-                                    .testTag("pdf_chat_engine_selector"),
-                                verticalArrangement = Arrangement.spacedBy(6.dp)
-                            ) {
-                                Text(
-                                    text = "1. SELECT CHAT MODEL",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.primary
-                                )
-
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                ) {
-                                    PdfEngineOptionCard(
-                                        option = PdfChatEngineOption.LOCAL_GEMMA_E2B,
-                                        selected = selectedEngine == PdfChatEngineOption.LOCAL_GEMMA_E2B,
-                                        onClick = { selectedEngine = PdfChatEngineOption.LOCAL_GEMMA_E2B },
-                                        testTag = "pdf_chat_option_local_gemma",
-                                        modifier = Modifier.weight(1f)
-                                    )
-
-                                    PdfEngineOptionCard(
-                                        option = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
-                                        selected = selectedEngine == PdfChatEngineOption.GEMINI_SUBSCRIPTION,
-                                        onClick = { selectedEngine = PdfChatEngineOption.GEMINI_SUBSCRIPTION },
-                                        testTag = "pdf_chat_option_gemini_subscription",
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                }
-
-                                if (selectedEngine == PdfChatEngineOption.GEMINI_SUBSCRIPTION) {
-                                    Surface(
-                                        shape = MaterialTheme.shapes.small,
-                                        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.65f),
-                                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.secondary.copy(alpha = 0.4f)),
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .testTag("pdf_chat_firebase_notice")
-                                    ) {
-                                        Row(
-                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                        ) {
-                                            Icon(
-                                                imageVector = Icons.Default.VerifiedUser,
-                                                contentDescription = null,
-                                                tint = MaterialTheme.colorScheme.secondary,
-                                                modifier = Modifier.size(16.dp)
-                                            )
-                                            Text(
-                                                text = stringResource(R.string.firebase_required_notice),
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = MaterialTheme.colorScheme.onSecondaryContainer
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-
-                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-
-                            // 3. Prominent Top Query Entry Card (Always Visible Above the Fold)
+                    // Unified Full-Screen Vertically Scrollable LazyColumn:
+                    // Contains Model Selector + Query Input Box + All Chat Messages so nothing ever overflows or gets stuck at the bottom!
+                    LazyColumn(
+                        state = listState,
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth()
+                            .testTag("pdf_chat_messages_list"),
+                        contentPadding = PaddingValues(
+                            start = 14.dp,
+                            end = 14.dp,
+                            top = 12.dp,
+                            bottom = 112.dp
+                        ),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        // Top Item: Model Selector + Query Input Box + Quick Prompts
+                        item(key = "pdf_chat_controls_and_query_box") {
                             Surface(
-                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+                                shape = MaterialTheme.shapes.medium,
+                                color = MaterialTheme.colorScheme.surface,
+                                tonalElevation = 2.dp,
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
                                 modifier = Modifier.fillMaxWidth()
                             ) {
                                 Column(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .padding(horizontal = 14.dp, vertical = 10.dp),
-                                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                                        .padding(12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(10.dp)
                                 ) {
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    // 1. Dual Chat Engine Selector
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .testTag("pdf_chat_engine_selector"),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp)
                                     ) {
-                                        Icon(
-                                            imageVector = Icons.Default.Forum,
-                                            contentDescription = null,
-                                            tint = MaterialTheme.colorScheme.primary,
-                                            modifier = Modifier.size(16.dp)
-                                        )
                                         Text(
-                                            text = "2. ENTER YOUR QUESTION ABOUT THIS PDF",
+                                            text = "1. SELECT CHAT MODEL",
                                             style = MaterialTheme.typography.labelSmall,
                                             fontWeight = FontWeight.Bold,
                                             color = MaterialTheme.colorScheme.primary
                                         )
-                                    }
 
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                    ) {
-                                        OutlinedTextField(
-                                            value = questionInput,
-                                            onValueChange = { questionInput = it },
-                                            placeholder = {
-                                                Text(
-                                                    text = if (selectedEngine == PdfChatEngineOption.LOCAL_GEMMA_E2B) {
-                                                        "Type a question for Local Gemma E2B…"
-                                                    } else {
-                                                        "Type a question for Gemini 3.8 Flash…"
-                                                    },
-                                                    maxLines = 1,
-                                                    overflow = TextOverflow.Ellipsis
-                                                )
-                                            },
-                                            trailingIcon = {
-                                                if (questionInput.isNotEmpty()) {
-                                                    IconButton(
-                                                        onClick = { questionInput = "" }
-                                                    ) {
-                                                        Icon(
-                                                            imageVector = Icons.Default.Clear,
-                                                            contentDescription = "Clear question"
-                                                        )
-                                                    }
-                                                }
-                                            },
-                                            singleLine = true,
-                                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                                            keyboardActions = KeyboardActions(
-                                                onSend = { sendQuestion(questionInput) }
-                                            ),
-                                            colors = OutlinedTextFieldDefaults.colors(
-                                                focusedContainerColor = MaterialTheme.colorScheme.surface,
-                                                unfocusedContainerColor = MaterialTheme.colorScheme.surface,
-                                                focusedBorderColor = MaterialTheme.colorScheme.primary,
-                                                unfocusedBorderColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.65f)
-                                            ),
-                                            modifier = Modifier
-                                                .weight(1f)
-                                                .testTag("pdf_chat_question_input")
-                                        )
-
-                                        Button(
-                                            onClick = { sendQuestion(questionInput) },
-                                            enabled = questionInput.isNotBlank() && !isGeneratingReply,
-                                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
-                                            modifier = Modifier
-                                                .height(54.dp)
-                                                .testTag("pdf_chat_send_button")
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
                                         ) {
-                                            if (isGeneratingReply) {
-                                                CircularProgressIndicator(
-                                                    modifier = Modifier.size(18.dp),
-                                                    strokeWidth = 2.dp,
-                                                    color = MaterialTheme.colorScheme.onPrimary
-                                                )
-                                            } else {
-                                                Icon(
-                                                    imageVector = Icons.AutoMirrored.Filled.Send,
-                                                    contentDescription = "Ask PDF Question",
-                                                    modifier = Modifier.size(18.dp)
-                                                )
-                                                Spacer(modifier = Modifier.width(6.dp))
-                                                Text(
-                                                    text = "Ask",
-                                                    style = MaterialTheme.typography.labelLarge,
-                                                    fontWeight = FontWeight.Bold
-                                                )
+                                            PdfEngineOptionCard(
+                                                option = PdfChatEngineOption.LOCAL_GEMMA_E2B,
+                                                selected = selectedEngine == PdfChatEngineOption.LOCAL_GEMMA_E2B,
+                                                onClick = { selectedEngine = PdfChatEngineOption.LOCAL_GEMMA_E2B },
+                                                testTag = "pdf_chat_option_local_gemma",
+                                                modifier = Modifier.weight(1f)
+                                            )
+
+                                            PdfEngineOptionCard(
+                                                option = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
+                                                selected = selectedEngine == PdfChatEngineOption.GEMINI_SUBSCRIPTION,
+                                                onClick = { selectedEngine = PdfChatEngineOption.GEMINI_SUBSCRIPTION },
+                                                testTag = "pdf_chat_option_gemini_subscription",
+                                                modifier = Modifier.weight(1f)
+                                            )
+                                        }
+
+                                        if (selectedEngine == PdfChatEngineOption.GEMINI_SUBSCRIPTION) {
+                                            Surface(
+                                                shape = MaterialTheme.shapes.small,
+                                                color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.65f),
+                                                border = BorderStroke(
+                                                    1.dp,
+                                                    MaterialTheme.colorScheme.secondary.copy(alpha = 0.4f)
+                                                ),
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .testTag("pdf_chat_firebase_notice")
+                                            ) {
+                                                Row(
+                                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                                ) {
+                                                    Icon(
+                                                        imageVector = Icons.Default.VerifiedUser,
+                                                        contentDescription = null,
+                                                        tint = MaterialTheme.colorScheme.secondary,
+                                                        modifier = Modifier.size(16.dp)
+                                                    )
+                                                    Text(
+                                                        text = stringResource(R.string.firebase_required_notice),
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        color = MaterialTheme.colorScheme.onSecondaryContainer
+                                                    )
+                                                }
                                             }
                                         }
                                     }
 
-                                    // Quick-Question Suggestion Strip
-                                    Row(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .horizontalScroll(rememberScrollState()),
-                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                        verticalAlignment = Alignment.CenterVertically
+                                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+
+                                    // 2. Query Input Box + Quick Prompts
+                                    Column(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        verticalArrangement = Arrangement.spacedBy(8.dp)
                                     ) {
-                                        val quickPrompts = listOf(
-                                            "Summarize this PDF",
-                                            "Key numbers, dates & totals",
-                                            "Main findings & values",
-                                            "List all pages & sections"
-                                        )
-                                        quickPrompts.forEachIndexed { idx, prompt ->
-                                            AssistChip(
-                                                onClick = { sendQuestion(prompt) },
-                                                label = {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Forum,
+                                                contentDescription = null,
+                                                tint = MaterialTheme.colorScheme.primary,
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                            Text(
+                                                text = "2. ENTER YOUR QUESTION ABOUT THIS PDF",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontWeight = FontWeight.Bold,
+                                                color = MaterialTheme.colorScheme.primary
+                                            )
+                                        }
+
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            OutlinedTextField(
+                                                value = questionInput,
+                                                onValueChange = { questionInput = it },
+                                                placeholder = {
                                                     Text(
-                                                        text = prompt,
-                                                        style = MaterialTheme.typography.labelSmall
+                                                        text = if (selectedEngine == PdfChatEngineOption.LOCAL_GEMMA_E2B) {
+                                                            "Type a question for Local Gemma E2B…"
+                                                        } else {
+                                                            "Type a question for Gemini 3.8 Flash…"
+                                                        },
+                                                        maxLines = 1,
+                                                        overflow = TextOverflow.Ellipsis
                                                     )
                                                 },
-                                                modifier = Modifier.testTag("pdf_chat_quick_prompt_$idx")
+                                                trailingIcon = {
+                                                    if (questionInput.isNotEmpty()) {
+                                                        IconButton(
+                                                            onClick = { questionInput = "" }
+                                                        ) {
+                                                            Icon(
+                                                                imageVector = Icons.Default.Clear,
+                                                                contentDescription = "Clear question"
+                                                            )
+                                                        }
+                                                    }
+                                                },
+                                                singleLine = true,
+                                                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                                                keyboardActions = KeyboardActions(
+                                                    onSend = { sendQuestion(questionInput) }
+                                                ),
+                                                colors = OutlinedTextFieldDefaults.colors(
+                                                    focusedContainerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                                                    unfocusedContainerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                                                    focusedBorderColor = MaterialTheme.colorScheme.primary,
+                                                    unfocusedBorderColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.65f)
+                                                ),
+                                                modifier = Modifier
+                                                    .weight(1f)
+                                                    .testTag("pdf_chat_question_input")
                                             )
+
+                                            Button(
+                                                onClick = { sendQuestion(questionInput) },
+                                                enabled = questionInput.isNotBlank() && !isGeneratingReply,
+                                                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+                                                modifier = Modifier
+                                                    .height(54.dp)
+                                                    .testTag("pdf_chat_send_button")
+                                            ) {
+                                                if (isGeneratingReply) {
+                                                    CircularProgressIndicator(
+                                                        modifier = Modifier.size(18.dp),
+                                                        strokeWidth = 2.dp,
+                                                        color = MaterialTheme.colorScheme.onPrimary
+                                                    )
+                                                } else {
+                                                    Icon(
+                                                        imageVector = Icons.AutoMirrored.Filled.Send,
+                                                        contentDescription = "Ask PDF Question",
+                                                        modifier = Modifier.size(18.dp)
+                                                    )
+                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                    Text(
+                                                        text = "Ask",
+                                                        style = MaterialTheme.typography.labelLarge,
+                                                        fontWeight = FontWeight.Bold
+                                                    )
+                                                }
+                                            }
+                                        }
+
+                                        // Quick-Question Suggestion Strip
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .horizontalScroll(rememberScrollState()),
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            val quickPrompts = listOf(
+                                                "Summarize this PDF",
+                                                "Key numbers, dates & totals",
+                                                "Main findings & values",
+                                                "List all pages & sections"
+                                            )
+                                            quickPrompts.forEachIndexed { idx, prompt ->
+                                                AssistChip(
+                                                    onClick = { sendQuestion(prompt) },
+                                                    label = {
+                                                        Text(
+                                                            text = prompt,
+                                                            style = MaterialTheme.typography.labelSmall
+                                                        )
+                                                    },
+                                                    modifier = Modifier.testTag("pdf_chat_quick_prompt_$idx")
+                                                )
+                                            }
                                         }
                                     }
                                 }
                             }
-
-                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                         }
-                    }
 
-                    // 4. Chat Conversation & Answers Area
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxWidth()
-                    ) {
                         if (isIndexingPdf && messages.isEmpty()) {
-                            Column(
-                                modifier = Modifier.align(Alignment.Center),
-                                horizontalAlignment = Alignment.CenterHorizontally,
-                                verticalArrangement = Arrangement.spacedBy(10.dp)
-                            ) {
-                                CircularProgressIndicator()
-                                Text(
-                                    text = "Extracting & cleaning PDF content for Q&A…",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
+                            item(key = "pdf_indexing_indicator") {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 32.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                                ) {
+                                    CircularProgressIndicator()
+                                    Text(
+                                        text = indexingProgressLabel,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
                             }
                         } else {
-                            LazyColumn(
-                                state = listState,
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .testTag("pdf_chat_messages_list"),
-                                contentPadding = PaddingValues(14.dp),
-                                verticalArrangement = Arrangement.spacedBy(12.dp)
-                            ) {
-                                items(
-                                    items = messages,
-                                    key = { it.id }
-                                ) { msg ->
-                                    PdfChatBubble(message = msg)
-                                }
+                            items(
+                                items = messages,
+                                key = { it.id }
+                            ) { msg ->
+                                PdfChatBubble(message = msg)
                             }
                         }
                     }
@@ -977,33 +1654,45 @@ private fun PdfChatBubble(message: PdfChatMessage) {
             shape = MaterialTheme.shapes.medium,
             color = bubbleColor,
             tonalElevation = 1.dp,
-            modifier = Modifier.widthIn(max = 640.dp)
+            modifier = Modifier
+                .fillMaxWidth(if (message.isUser) 0.88f else 1f)
+                .widthIn(max = 680.dp)
         ) {
             Column(
-                modifier = Modifier.padding(12.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp)
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     if (!message.isUser) {
-                        Icon(
-                            imageVector = when {
-                                message.isError -> Icons.Default.ErrorOutline
-                                message.engine == PdfChatEngineOption.LOCAL_GEMMA_E2B -> Icons.Default.Memory
-                                else -> Icons.Default.AutoAwesome
-                            },
-                            contentDescription = null,
-                            tint = textColor.copy(alpha = 0.85f),
-                            modifier = Modifier.size(14.dp)
-                        )
+                        if (message.isStreaming) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(14.dp),
+                                strokeWidth = 2.dp,
+                                color = textColor
+                            )
+                        } else {
+                            Icon(
+                                imageVector = when {
+                                    message.isError -> Icons.Default.ErrorOutline
+                                    message.engine == PdfChatEngineOption.LOCAL_GEMMA_E2B -> Icons.Default.Memory
+                                    else -> Icons.Default.AutoAwesome
+                                },
+                                contentDescription = null,
+                                tint = textColor.copy(alpha = 0.85f),
+                                modifier = Modifier.size(14.dp)
+                            )
+                        }
                     }
                     Text(
                         text = when {
                             message.isUser -> "You"
                             message.isError -> "${message.engine.badgeLabel} • Error"
-                            message.isStreaming -> "${message.engine.badgeLabel} • Streaming…"
+                            message.isStreaming -> "${message.engine.badgeLabel} • Generating…"
                             else -> message.engine.badgeLabel
                         },
                         style = MaterialTheme.typography.labelSmall,
@@ -1015,12 +1704,16 @@ private fun PdfChatBubble(message: PdfChatMessage) {
                 Text(
                     text = message.text,
                     style = MaterialTheme.typography.bodyMedium,
-                    color = textColor
+                    color = textColor,
+                    softWrap = true,
+                    modifier = Modifier.fillMaxWidth()
                 )
 
                 if (message.pageCitations.isNotEmpty()) {
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {

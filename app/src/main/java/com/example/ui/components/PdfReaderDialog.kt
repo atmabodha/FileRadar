@@ -93,6 +93,9 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.example.R
 import com.example.model.PhoneFileItem
+import com.example.pdfextractor.HybridPdfExtractor
+import com.example.pdfextractor.model.ExtractedPage
+import com.example.pdfextractor.model.ExtractionSource
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
@@ -194,8 +197,10 @@ fun FullScreenPdfReaderDialog(
     var isTextMode by remember(file.id) { mutableStateOf(false) }
     var textFontSizeSp by remember(file.id) { mutableFloatStateOf(15f) }
     var zoomScale by remember(file.id) { mutableFloatStateOf(1f) }
-    var extractedPagesText by remember(file.id) { mutableStateOf<List<String>>(emptyList()) }
+    var extractedPages by remember(file.id) { mutableStateOf<List<ExtractedPage>>(emptyList()) }
     var isExtractingText by remember(file.id) { mutableStateOf(false) }
+    var extractionProgressText by remember(file.id) { mutableStateOf("Extracting text (PDFBox + ML Kit OCR)…") }
+    val hybridExtractor = remember(context) { HybridPdfExtractor(context.applicationContext) }
 
     val activeVisiblePage by remember {
         derivedStateOf {
@@ -214,13 +219,19 @@ fun FullScreenPdfReaderDialog(
         isPreparingDocument = false
     }
 
-    // Extract real text when switching to Text View
+    // Extract text via HybridPdfExtractor (Stage 1: PDFBox digital text -> Stage 2: PdfRenderer + ML Kit OCR)
     LaunchedEffect(file.id, isTextMode, pageCount) {
-        if (isTextMode && extractedPagesText.isEmpty() && !isExtractingText) {
+        if (isTextMode && extractedPages.isEmpty() && !isExtractingText) {
             isExtractingText = true
-            extractedPagesText = withContext(Dispatchers.IO) {
-                extractReadablePagesFromPdf(context, file, pageCount)
+            val result = withContext(Dispatchers.IO) {
+                hybridExtractor.extractForPhoneFile(
+                    file = file,
+                    onPageProgress = { current, total ->
+                        extractionProgressText = "Extracting Page $current of $total (PDFBox + ML Kit OCR)…"
+                    }
+                )
             }
+            extractedPages = result.pages
             isExtractingText = false
         }
     }
@@ -228,6 +239,7 @@ fun FullScreenPdfReaderDialog(
     DisposableEffect(file.id) {
         onDispose {
             renderSession?.close()
+            hybridExtractor.close()
         }
     }
 
@@ -507,7 +519,7 @@ fun FullScreenPdfReaderDialog(
                             ) {
                                 CircularProgressIndicator(color = Color(0xFF38BDF8))
                                 Text(
-                                    text = "Extracting text from PDF streams…",
+                                    text = extractionProgressText,
                                     style = MaterialTheme.typography.bodyMedium,
                                     color = Color.White
                                 )
@@ -520,7 +532,7 @@ fun FullScreenPdfReaderDialog(
                                 contentPadding = PaddingValues(16.dp),
                                 verticalArrangement = Arrangement.spacedBy(16.dp)
                             ) {
-                                itemsIndexed(extractedPagesText) { idx, pageContent ->
+                                itemsIndexed(extractedPages) { idx, pageItem ->
                                     Surface(
                                         shape = MaterialTheme.shapes.medium,
                                         color = Color(0xFFF8FAFC),
@@ -548,8 +560,28 @@ fun FullScreenPdfReaderDialog(
                                                     modifier = Modifier.weight(1f)
                                                 )
                                                 Spacer(modifier = Modifier.width(8.dp))
+                                                Surface(
+                                                    shape = MaterialTheme.shapes.extraSmall,
+                                                    color = if (pageItem.source == ExtractionSource.ML_KIT_OCR) {
+                                                        Color(0xFFFEF3C7)
+                                                    } else {
+                                                        Color(0xFFE0F2FE)
+                                                    }
+                                                ) {
+                                                    Text(
+                                                        text = pageItem.source.badgeLabel,
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        color = if (pageItem.source == ExtractionSource.ML_KIT_OCR) {
+                                                            Color(0xFFB45309)
+                                                        } else {
+                                                            Color(0xFF0369A1)
+                                                        },
+                                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                    )
+                                                }
+                                                Spacer(modifier = Modifier.width(8.dp))
                                                 Text(
-                                                    text = "Page ${idx + 1} of ${extractedPagesText.size}",
+                                                    text = "Page ${idx + 1} of ${extractedPages.size}",
                                                     style = MaterialTheme.typography.labelSmall,
                                                     fontFamily = FontFamily.Monospace,
                                                     color = Color(0xFF0284C7)
@@ -557,7 +589,9 @@ fun FullScreenPdfReaderDialog(
                                             }
                                             HorizontalDivider(color = Color(0xFFE2E8F0))
                                             Text(
-                                                text = pageContent,
+                                                text = pageItem.normalizedText.ifBlank {
+                                                    "No readable text detected on Page ${idx + 1}."
+                                                },
                                                 fontSize = textFontSizeSp.sp,
                                                 lineHeight = (textFontSizeSp * 1.45f).sp,
                                                 color = Color(0xFF0F172A)
@@ -1771,7 +1805,7 @@ private fun generateSamplePdfFile(
     }
 }
 
-private fun buildSamplePdfPagesText(file: PhoneFileItem): List<String> {
+internal fun buildSamplePdfPagesText(file: PhoneFileItem): List<String> {
     val lower = file.name.lowercase(Locale.ROOT)
     val metaBlock = "DOCUMENT METADATA\n" +
         "• File Name: ${file.name}\n" +
