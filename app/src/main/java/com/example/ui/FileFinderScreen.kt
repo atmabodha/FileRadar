@@ -132,6 +132,7 @@ fun FileFinderScreen(
             showImageOcrScanner -> {
                 showImageOcrScanner = false
                 initialOcrImageFile = null
+                viewModel.rescanStorage()
             }
             uiState.activePdfChatFile != null -> viewModel.closePdfChat()
             uiState.activePdfReaderFile != null -> viewModel.closePdfReader()
@@ -386,6 +387,10 @@ fun FileFinderScreen(
                             initialOcrImageFile = null
                             showImageOcrScanner = true
                         },
+                        isScanning = uiState.isScanning,
+                        hasAllFilesAccess = uiState.hasAllFilesAccess,
+                        onRescan = viewModel::rescanStorage,
+                        onGrantAllFilesAccess = launchAllFilesAccessSettings,
                         modifier = Modifier.widthIn(max = 760.dp)
                     )
                 }
@@ -497,6 +502,7 @@ fun FileFinderScreen(
                     onDismiss = {
                         showImageOcrScanner = false
                         initialOcrImageFile = null
+                        viewModel.rescanStorage()
                     }
                 )
             }

@@ -4,21 +4,24 @@ import android.net.Uri
 
 enum class ExtractionSource(val badgeLabel: String) {
     PDF_TEXT("Digital Text (PDFBox)"),
-    ML_KIT_OCR("On-Device OCR (ML Kit)"),
+    ML_KIT_OCR("Visual OCR (ML Kit)"),
+    FUSED_HYBRID_OCR("Hybrid Fused (PDFBox + Visual OCR)"),
     SKIPPED_OCR_DISABLED("OCR Disabled"),
     EMPTY("No Text Detected")
 }
 
 data class ExtractionConfig(
     val enableOcrFallback: Boolean = true,
+    val forceOcrAllPages: Boolean = false,
+    val smartVisualOcrFusion: Boolean = true,
     val minMeaningfulChars: Int = 40,
     val minMeaningfulWords: Int = 6,
-    val renderDpi: Int = 180,
+    val renderDpi: Int = 220,
     val maxBitmapDimensionPx: Int = 2480,
     val throttleDelayMs: Long = 0L,
     val chunkSizeChars: Int = 800,
     val chunkOverlapChars: Int = 100,
-    val enhanceContrastForOcr: Boolean = true,
+    val enhanceContrastForOcr: Boolean = false,
     val stripRunningHeadersFooters: Boolean = true
 )
 

@@ -95,7 +95,7 @@ class HybridPdfExtractor(
         config: ExtractionConfig = ExtractionConfig(),
         onPageProgress: ((currentPage: Int, totalPages: Int) -> Unit)? = null
     ): DocumentExtractionResult = withContext(Dispatchers.IO) {
-        val cacheKey = "${file.id}_${file.modifiedAtMillis}_ocr_${config.enableOcrFallback}_v2"
+        val cacheKey = "${file.id}_${file.modifiedAtMillis}_ocr_${config.enableOcrFallback}_force_${config.forceOcrAllPages}_fusion_${config.smartVisualOcrFusion}_v3"
         HybridPdfExtractionCache.get(cacheKey)?.let { cached ->
             onPageProgress?.invoke(cached.totalPages, cached.totalPages)
             return@withContext cached
@@ -131,7 +131,8 @@ class HybridPdfExtractor(
 
     /**
      * Extracts text per page from a content:// or file:// PDF URI using PDFBox first,
-     * falling back to PdfRenderer + ML Kit OCR per page when embedded text is insufficient.
+     * falling back to (or fusing with) PdfRenderer + ML Kit Vision OCR per page when embedded text
+     * is insufficient, has low lexical/layout coherence, or when [ExtractionConfig.forceOcrAllPages] is true.
      */
     suspend fun extractDocument(
         uri: Uri,
@@ -156,7 +157,7 @@ class HybridPdfExtractor(
                 if (isTemp) tempCacheFile = file
             }.first
 
-            // Lazily open PdfRenderer only if at least one page triggers OCR fallback or PDFBox cannot open
+            // Lazily open PdfRenderer only if at least one page triggers OCR or PDFBox cannot open
             fun getOrCreateRenderer(): PdfRenderer {
                 pdfRenderer?.let { return it }
                 val descriptor = ParcelFileDescriptor.open(
@@ -167,11 +168,14 @@ class HybridPdfExtractor(
                 return PdfRenderer(descriptor).also { pdfRenderer = it }
             }
 
-            val pdDocResult = runCatching { PDDocument.load(seekableFile) }
-            val pdDocument = pdDocResult.getOrNull()
+            val pdDocResult = if (config.forceOcrAllPages && config.enableOcrFallback) {
+                null
+            } else {
+                runCatching { PDDocument.load(seekableFile) }.getOrNull()
+            }
 
-            if (pdDocument != null) {
-                pdDocument.use { doc ->
+            if (pdDocResult != null) {
+                pdDocResult.use { doc ->
                     val totalPages = doc.numberOfPages.coerceAtLeast(1)
                     val stripper = PDFTextStripper().apply {
                         sortByPosition = true
@@ -189,8 +193,12 @@ class HybridPdfExtractor(
                         stripper.endPage = pageNumber
                         val rawEmbedded = runCatching { stripper.getText(doc) }.getOrDefault("")
                         val cleanedEmbedded = cleanAndSanitizePdfPageText(rawEmbedded)
+                        val embeddedSufficient = hasSufficientText(cleanedEmbedded, config)
+                        val embeddedSuspicious = config.smartVisualOcrFusion &&
+                            pageIndex < 12 &&
+                            isDigitalTextLikelyIncompleteOrDegraded(rawEmbedded, cleanedEmbedded)
 
-                        val pageResult = if (hasSufficientText(cleanedEmbedded, config)) {
+                        val pageResult = if (embeddedSufficient && !embeddedSuspicious && !config.forceOcrAllPages) {
                             val normalized = TextNormalizer.normalize(cleanedEmbedded)
                             ExtractedPage(
                                 pageNumber = pageNumber,
@@ -211,27 +219,23 @@ class HybridPdfExtractor(
                                 }
                             )
                         } else {
-                            // 2. Fallback: Render single page to Bitmap and run ML Kit OCR with spatial row clustering
+                            // 2. Render single page to Bitmap and run ML Kit Vision OCR with spatial row clustering
                             val ocrText = runCatching {
                                 extractPageWithOcr(getOrCreateRenderer(), pageIndex, config)
                             }.getOrDefault("")
                             val cleanedOcr = cleanAndSanitizePdfPageText(ocrText)
-                            val bestText = if (cleanedOcr.length >= cleanedEmbedded.length) {
-                                cleanedOcr
-                            } else {
-                                cleanedEmbedded
-                            }
-                            val normalized = TextNormalizer.normalize(bestText)
-                            val source = when {
-                                normalized.isBlank() -> ExtractionSource.EMPTY
-                                cleanedOcr.length >= cleanedEmbedded.length && cleanedOcr.isNotBlank() -> ExtractionSource.ML_KIT_OCR
-                                else -> ExtractionSource.PDF_TEXT
-                            }
+
+                            val (chosenText, chosenSource) = selectOrFuseDigitalAndVisualOcrText(
+                                cleanedDigital = cleanedEmbedded,
+                                cleanedVisualOcr = cleanedOcr,
+                                forceVisualOcr = config.forceOcrAllPages
+                            )
+                            val normalized = TextNormalizer.normalize(chosenText)
                             ExtractedPage(
                                 pageNumber = pageNumber,
-                                rawText = bestText,
+                                rawText = chosenText,
                                 normalizedText = normalized,
-                                source = source
+                                source = if (normalized.isBlank()) ExtractionSource.EMPTY else chosenSource
                             )
                         }
 
@@ -244,8 +248,8 @@ class HybridPdfExtractor(
                     }
                 }
             } else if (config.enableOcrFallback) {
-                // If PDFBox failed to parse structure (e.g. non-standard XRef/encrypted header),
-                // use native Android PdfRenderer + ML Kit OCR per page
+                // Full Visual OCR path (identical to the Image OCR scanner): renders every page via
+                // native Android PdfRenderer at 220 DPI and runs Google ML Kit Vision OCR + spatial table reconstruction
                 val renderer = getOrCreateRenderer()
                 val totalPages = renderer.pageCount.coerceAtLeast(1)
                 for (pageIndex in 0 until totalPages) {
@@ -323,11 +327,10 @@ class HybridPdfExtractor(
                 bitmap = bmp
 
                 val canvas = Canvas(bmp)
-                // Fill white background so transparent PDFs render cleanly for OCR
+                // Fill white background so transparent PDFs render cleanly for OCR (identical to Image OCR scanner)
                 canvas.drawColor(Color.WHITE)
                 page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
 
-                // In-place high-contrast luminance enhancement so faint scans & gray receipts sharpen before OCR
                 if (config.enhanceContrastForOcr) {
                     applyInPlaceHighContrastFilter(canvas, bmp)
                 }
@@ -345,12 +348,12 @@ class HybridPdfExtractor(
     }
 
     /**
-     * Applies an in-place high-contrast luminance curve onto the rendered page Bitmap without
-     * allocating a second Bitmap, boosting ML Kit recognition on faded scans and light-gray fonts.
+     * Applies a non-destructive midpoint contrast curve centered around 128 (`translate = 128f * (1f - contrast)`)
+     * so white paper backgrounds stay pure white (255) and anti-aliased strokes remain crisp.
      */
     private fun applyInPlaceHighContrastFilter(canvas: Canvas, bmp: Bitmap) {
-        val contrast = 1.22f
-        val translate = -18f
+        val contrast = 1.25f
+        val translate = 128f * (1f - contrast)
         val matrix = ColorMatrix(
             floatArrayOf(
                 contrast, 0f, 0f, 0f, translate,
@@ -456,6 +459,117 @@ class HybridPdfExtractor(
         return sb.toString().trim()
     }
 
+    /**
+     * Detects when PDFBox extracted some digital text (passing the minimum 40-char threshold),
+     * but the page is likely a hybrid PDF (e.g., an embedded scanned form or image with only a watermark
+     * or header in the digital text layer, or fragmented multi-column text with unmapped subset glyphs)
+     * that would benefit from running Visual ML Kit OCR and comparing/fusing both outputs.
+     */
+    internal fun isDigitalTextLikelyIncompleteOrDegraded(
+        rawDigital: String,
+        cleanedDigital: String
+    ): Boolean {
+        val trimmed = cleanedDigital.trim()
+        // Hybrid scanned PDFs often have only a short digital stamp/header (< 180 chars) while the rest of the page is an image
+        if (trimmed.length < 180) return true
+
+        // If >28% of raw characters were dropped during sanitization, the PDF likely has broken subset font mappings
+        if (rawDigital.length > 80 && trimmed.length.toFloat() / rawDigital.length.toFloat() < 0.72f) {
+            return true
+        }
+
+        val lines = trimmed.lines().map { it.trim() }.filter { it.isNotEmpty() }
+        if (lines.isEmpty()) return true
+
+        // Fragmented multi-column or table explosion where most lines are 1-2 short tokens without table delimiters
+        val shortFragmentLines = lines.count { line ->
+            !line.contains('|') && !line.contains(':') && line.split(' ').size <= 2 && line.length < 18
+        }
+        if (lines.size >= 6 && shortFragmentLines.toFloat() / lines.size.toFloat() > 0.55f) {
+            return true
+        }
+
+        return false
+    }
+
+    /**
+     * Evaluates the readability, word count, and structural completeness of both PDFBox digital text
+     * and ML Kit Visual OCR text for the same page, returning the superior extraction—or fusing
+     * unique visual OCR lines (such as text inside embedded diagrams, stamps, or scanned headers)
+     * with the digital text layer.
+     */
+    internal fun selectOrFuseDigitalAndVisualOcrText(
+        cleanedDigital: String,
+        cleanedVisualOcr: String,
+        forceVisualOcr: Boolean = false
+    ): Pair<String, ExtractionSource> {
+        val digital = cleanedDigital.trim()
+        val visual = cleanedVisualOcr.trim()
+
+        if (forceVisualOcr && visual.isNotEmpty()) {
+            return visual to ExtractionSource.ML_KIT_OCR
+        }
+        if (digital.isEmpty() && visual.isEmpty()) {
+            return "" to ExtractionSource.EMPTY
+        }
+        if (digital.isEmpty()) {
+            return visual to ExtractionSource.ML_KIT_OCR
+        }
+        if (visual.isEmpty()) {
+            return digital to ExtractionSource.PDF_TEXT
+        }
+
+        val digitalScore = computeExtractionReadabilityScore(digital)
+        val visualScore = computeExtractionReadabilityScore(visual)
+
+        // If Visual OCR captured significantly more content (e.g. scanned form body + digital header)
+        // or clearly higher structural readability (e.g. reconstructed " | " table rows), prefer Visual OCR
+        if (visualScore >= digitalScore * 1.08) {
+            // Check if digital has any unique lines not present in visual OCR
+            val visualLower = visual.lowercase()
+            val extraDigitalLines = digital.lines()
+                .map { it.trim() }
+                .filter { line ->
+                    line.length >= 12 && !visualLower.contains(line.take(20).lowercase())
+                }
+            return if (extraDigitalLines.isNotEmpty() && extraDigitalLines.size <= 6) {
+                (visual + "\n" + extraDigitalLines.joinToString("\n")) to ExtractionSource.FUSED_HYBRID_OCR
+            } else {
+                visual to ExtractionSource.ML_KIT_OCR
+            }
+        }
+
+        // Otherwise digital text is strong; append any unique lines found by Visual OCR (e.g. embedded image banners/stamps)
+        val digitalLower = digital.lowercase()
+        val extraVisualLines = visual.lines()
+            .map { it.trim() }
+            .filter { line ->
+                line.length >= 12 && !digitalLower.contains(line.take(20).lowercase())
+            }
+        return if (extraVisualLines.isNotEmpty()) {
+            (digital + "\n" + extraVisualLines.joinToString("\n")) to ExtractionSource.FUSED_HYBRID_OCR
+        } else {
+            digital to ExtractionSource.PDF_TEXT
+        }
+    }
+
+    internal fun computeExtractionReadabilityScore(text: String): Double {
+        if (text.isBlank()) return 0.0
+        val tokens = text.split(Regex("\\s+")).filter { it.isNotEmpty() }
+        if (tokens.isEmpty()) return 0.0
+
+        val naturalWords = tokens.count { token ->
+            val letters = token.count { it.isLetter() }
+            val vowels = token.count { it.lowercaseChar() in "aeiouy" }
+            (letters in 2..22 && vowels >= 1) || token.any { it.isDigit() }
+        }
+        val tableRowBonus = text.lines().count { it.contains(" | ") } * 6.0
+        val keyValueBonus = text.lines().count { it.contains(": ") } * 2.5
+        val naturalRatio = naturalWords.toDouble() / tokens.size.toDouble()
+
+        return (naturalWords * naturalRatio) + tableRowBonus + keyValueBonus
+    }
+
     internal fun hasSufficientText(text: String, config: ExtractionConfig): Boolean {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return false
@@ -467,7 +581,7 @@ class HybridPdfExtractor(
         val validWords = tokens.count { token ->
             val letters = token.count { it.isLetter() }
             val digits = token.count { it.isDigit() }
-            (letters >= 2 || digits >= 1) && (letters + digits).toFloat() / token.length.toFloat() >= 0.6f
+            (letters >= 2 || digits >= 1) && (letters + digits).toFloat() / token.length.toFloat() >= 0.55f
         }
         if (validWords < config.minMeaningfulWords) return false
 

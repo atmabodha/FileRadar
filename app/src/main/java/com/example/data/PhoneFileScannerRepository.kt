@@ -172,7 +172,12 @@ class PhoneFileScannerRepository(private val context: Context) {
             }
         }
 
-        discoveredByPath.values.toList()
+        // Always order real device files ahead of sample files, and newest modified/captured files first
+        discoveredByPath.values.sortedWith(
+            compareBy<PhoneFileItem> { it.isSampleFile }
+                .thenByDescending { it.modifiedAtMillis }
+                .thenBy(String.CASE_INSENSITIVE_ORDER) { it.name }
+        )
     }
 
     private fun walkAccessibleDirectories(
@@ -183,12 +188,22 @@ class PhoneFileScannerRepository(private val context: Context) {
         val visitedDirs = HashSet<String>()
         val candidateRoots = mutableListOf<Pair<File, Boolean>>()
 
-        // Prioritize standard user-facing public directories first so Downloads, Documents, DCIM, etc. are always scanned first
+        // 0. Include in-app camera OCR captures directory so photos taken in File Radar appear immediately
+        try {
+            val ocrCapturesDir = File(context.cacheDir, "ocr_captures")
+            if (ocrCapturesDir.exists()) {
+                candidateRoots.add(ocrCapturesDir to false)
+            }
+        } catch (_: Throwable) {
+            // Ignore
+        }
+
+        // 1. Prioritize DCIM & Pictures first alongside Downloads & Documents so recent phone photos/screenshots are never starved
         val publicDirs = listOf(
-            Environment.DIRECTORY_DOWNLOADS,
-            Environment.DIRECTORY_DOCUMENTS,
             Environment.DIRECTORY_DCIM,
             Environment.DIRECTORY_PICTURES,
+            Environment.DIRECTORY_DOWNLOADS,
+            Environment.DIRECTORY_DOCUMENTS,
             Environment.DIRECTORY_MOVIES,
             Environment.DIRECTORY_MUSIC,
             Environment.DIRECTORY_PODCASTS,
@@ -206,10 +221,10 @@ class PhoneFileScannerRepository(private val context: Context) {
             }
         }
 
-        // Then add full storage roots (/storage/emulated/0 and removable SD card roots)
+        // 2. Then add full storage roots (/storage/emulated/0 and removable SD card roots)
         candidateRoots.addAll(mountedVolumeDirs)
 
-        // Add app external dirs
+        // 3. Add app external dirs
         val externalDirs = context.getExternalFilesDirs(null).filterNotNull()
         externalDirs.forEachIndexed { index, rootDir ->
             val isRemovable = try {
@@ -221,20 +236,25 @@ class PhoneFileScannerRepository(private val context: Context) {
         }
 
         val nowMs = System.currentTimeMillis()
+        val isOcrCaptureRoot: (File) -> Boolean = { dir ->
+            dir.absolutePath.contains("/cache/ocr_captures")
+        }
 
         for ((rootDir, isRemovable) in candidateRoots) {
             if (found.size >= MAX_WALKED_FILES) break
             val storageLocation = if (isRemovable) StorageLocation.SD_CARD else StorageLocation.INTERNAL
             val volumeLabel = if (isRemovable) sdVolumeLabel else "Internal Shared Storage"
+            val allowCacheSubdir = isOcrCaptureRoot(rootDir)
+            val rootFoundFiles = mutableListOf<File>()
 
             try {
                 rootDir.walkTopDown()
                     .onEnter { dir ->
-                        if (found.size >= MAX_WALKED_FILES) return@onEnter false
+                        if (rootFoundFiles.size >= MAX_FILES_PER_ROOT * 2) return@onEnter false
                         val name = dir.name
                         if (name.startsWith(".")) return@onEnter false
                         val lowerName = name.lowercase(Locale.ROOT)
-                        if (lowerName in SKIPPED_DIR_NAMES) return@onEnter false
+                        if (!allowCacheSubdir && lowerName in SKIPPED_DIR_NAMES) return@onEnter false
 
                         val path = dir.absolutePath
                         if (path.endsWith("/Android/data") ||
@@ -248,38 +268,51 @@ class PhoneFileScannerRepository(private val context: Context) {
                     }
                     .maxDepth(8)
                     .forEach { file ->
-                        if (found.size >= MAX_WALKED_FILES) return@forEach
                         if (!file.isFile || file.name.startsWith(".")) return@forEach
                         val fullPath = file.absolutePath
                         if (found.containsKey(fullPath)) return@forEach
-
-                        val sizeBytes = file.length()
-                        if (sizeBytes <= 0L) return@forEach
-
-                        val ext = resolveExtension(file.name, null)
-                        if (ext.isNotEmpty()) {
-                            val modifiedMs = file.lastModified().takeIf { it > 0L } ?: nowMs
-                            val mime = MimeTypeMap.getSingleton()
-                                .getMimeTypeFromExtension(ext.lowercase(Locale.ROOT))
-                                ?: "application/octet-stream"
-
-                            found[fullPath] = PhoneFileItem(
-                                id = fullPath,
-                                name = file.name,
-                                extension = ext,
-                                fullPath = fullPath,
-                                sizeBytes = sizeBytes,
-                                createdAtMillis = modifiedMs,
-                                modifiedAtMillis = modifiedMs,
-                                storageLocation = storageLocation,
-                                volumeLabel = volumeLabel,
-                                category = FileCategory.fromExtension(ext, mime),
-                                mimeType = mime
-                            )
-                        }
+                        if (file.length() <= 0L) return@forEach
+                        rootFoundFiles.add(file)
                     }
             } catch (_: Throwable) {
                 // Skip unreadable directory trees
+            }
+
+            // Sort files discovered in this root by lastModified DESC so the newest photos/files are always picked first
+            val newestInRoot = rootFoundFiles
+                .sortedByDescending { it.lastModified() }
+                .take(MAX_FILES_PER_ROOT)
+
+            for (file in newestInRoot) {
+                if (found.size >= MAX_WALKED_FILES) break
+                val fullPath = file.absolutePath
+                if (found.containsKey(fullPath)) continue
+
+                val sizeBytes = file.length()
+                if (sizeBytes <= 0L) continue
+
+                val ext = resolveExtension(file.name, null)
+                if (ext.isNotEmpty()) {
+                    val modifiedMs = file.lastModified().takeIf { it > 0L } ?: nowMs
+                    val mime = MimeTypeMap.getSingleton()
+                        .getMimeTypeFromExtension(ext.lowercase(Locale.ROOT))
+                        ?: "application/octet-stream"
+
+                    found[fullPath] = PhoneFileItem(
+                        id = fullPath,
+                        name = file.name,
+                        extension = ext,
+                        fullPath = fullPath,
+                        sizeBytes = sizeBytes,
+                        createdAtMillis = modifiedMs,
+                        modifiedAtMillis = modifiedMs,
+                        storageLocation = storageLocation,
+                        volumeLabel = volumeLabel,
+                        category = FileCategory.fromExtension(ext, mime),
+                        mimeType = mime,
+                        isSampleFile = false
+                    )
+                }
             }
         }
         return found.values.toList()
@@ -454,20 +487,28 @@ class PhoneFileScannerRepository(private val context: Context) {
             setOf("external")
         }
 
-        val projection = arrayOf(
-            MediaStore.Files.FileColumns._ID,
-            MediaStore.Files.FileColumns.DISPLAY_NAME,
-            MediaStore.Files.FileColumns.SIZE,
-            MediaStore.Files.FileColumns.DATE_ADDED,
-            MediaStore.Files.FileColumns.DATE_MODIFIED,
-            MediaStore.Files.FileColumns.MIME_TYPE,
-            MediaStore.Files.FileColumns.DATA,
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        val projection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            arrayOf(
+                MediaStore.Files.FileColumns._ID,
+                MediaStore.Files.FileColumns.DISPLAY_NAME,
+                MediaStore.Files.FileColumns.SIZE,
+                MediaStore.Files.FileColumns.DATE_ADDED,
+                MediaStore.Files.FileColumns.DATE_MODIFIED,
+                MediaStore.Files.FileColumns.MIME_TYPE,
+                MediaStore.Files.FileColumns.DATA,
                 MediaStore.Files.FileColumns.RELATIVE_PATH
-            } else {
+            )
+        } else {
+            arrayOf(
+                MediaStore.Files.FileColumns._ID,
+                MediaStore.Files.FileColumns.DISPLAY_NAME,
+                MediaStore.Files.FileColumns.SIZE,
+                MediaStore.Files.FileColumns.DATE_ADDED,
+                MediaStore.Files.FileColumns.DATE_MODIFIED,
+                MediaStore.Files.FileColumns.MIME_TYPE,
                 MediaStore.Files.FileColumns.DATA
-            }
-        )
+            )
+        }
 
         for (volumeName in volumeNames) {
             val isPrimary = volumeName == MediaStore.VOLUME_EXTERNAL_PRIMARY || volumeName == "external"
@@ -475,24 +516,27 @@ class PhoneFileScannerRepository(private val context: Context) {
             val mountPrefix = if (isPrimary) "/storage/emulated/0" else "/storage/${volumeName.uppercase(Locale.ROOT)}"
             val volumeLabel = if (isPrimary) "Internal Shared Storage" else sdVolumeLabel
 
+            // Query MediaStore.Images.Media FIRST so recent phone photos & screenshots are always captured
+            // with their canonical Image content:// URI and never crowded out by generic MediaStore.Files rows
             val urisToQuery = mutableListOf<Uri>()
-            urisToQuery.add(MediaStore.Files.getContentUri(volumeName))
+            urisToQuery.add(MediaStore.Images.Media.getContentUri(volumeName))
+            urisToQuery.add(MediaStore.Video.Media.getContentUri(volumeName))
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 urisToQuery.add(MediaStore.Downloads.getContentUri(volumeName))
             }
-            urisToQuery.add(MediaStore.Images.Media.getContentUri(volumeName))
-            urisToQuery.add(MediaStore.Video.Media.getContentUri(volumeName))
             urisToQuery.add(MediaStore.Audio.Media.getContentUri(volumeName))
+            urisToQuery.add(MediaStore.Files.getContentUri(volumeName))
 
             for (uri in urisToQuery) {
                 if (items.size >= MAX_MEDIASTORE_FILES) break
+                val isImagesTable = uri == MediaStore.Images.Media.getContentUri(volumeName)
                 try {
                     contentResolver.query(
                         uri,
                         projection,
                         null,
                         null,
-                        "${MediaStore.Files.FileColumns.DATE_MODIFIED} DESC"
+                        "${MediaStore.Files.FileColumns.DATE_MODIFIED} DESC, ${MediaStore.Files.FileColumns.DATE_ADDED} DESC"
                     )?.use { cursor ->
                         val idIdx = cursor.getColumnIndex(MediaStore.Files.FileColumns._ID)
                         val nameIdx = cursor.getColumnIndex(MediaStore.Files.FileColumns.DISPLAY_NAME)
@@ -506,15 +550,19 @@ class PhoneFileScannerRepository(private val context: Context) {
                         } else -1
 
                         var rowCount = 0
-                        while (cursor.moveToNext() && rowCount < 1200 && items.size < MAX_MEDIASTORE_FILES) {
+                        while (cursor.moveToNext() && rowCount < MAX_ROWS_PER_MEDIASTORE_URI && items.size < MAX_MEDIASTORE_FILES) {
                             rowCount++
-                            val displayName = if (nameIdx >= 0) cursor.getString(nameIdx) else null
-                            if (displayName.isNullOrBlank()) continue
-                            val size = if (sizeIdx >= 0) cursor.getLong(sizeIdx) else 0L
-                            if (size <= 0L) continue
+                            val rawDataPath = if (dataIdx >= 0 && !cursor.isNull(dataIdx)) cursor.getString(dataIdx) else null
+                            val displayName = (if (nameIdx >= 0 && !cursor.isNull(nameIdx)) cursor.getString(nameIdx) else null)
+                                ?.takeIf { it.isNotBlank() }
+                                ?: rawDataPath?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
+                                ?: continue
 
-                            val mime = if (mimeIdx >= 0) cursor.getString(mimeIdx) else null
-                            val ext = resolveExtension(displayName, mime)
+                            val mime = (if (mimeIdx >= 0 && !cursor.isNull(mimeIdx)) cursor.getString(mimeIdx) else null)
+                                ?: if (isImagesTable) "image/jpeg" else null
+                            val ext = resolveExtension(displayName, mime).ifEmpty {
+                                if (isImagesTable) "jpg" else ""
+                            }
                             if (ext.isEmpty()) continue
 
                             val rowId = if (idIdx >= 0 && !cursor.isNull(idIdx)) cursor.getLong(idIdx) else -1L
@@ -526,25 +574,39 @@ class PhoneFileScannerRepository(private val context: Context) {
                                 }
                             } else null
 
-                            val addedSec = if (addedIdx >= 0) cursor.getLong(addedIdx) else 0L
-                            val modSec = if (modIdx >= 0) cursor.getLong(modIdx) else 0L
-                            val rawDataPath = if (dataIdx >= 0) cursor.getString(dataIdx) else null
-                            val relPath = if (relIdx >= 0) cursor.getString(relIdx) else null
+                            val addedRaw = if (addedIdx >= 0 && !cursor.isNull(addedIdx)) cursor.getLong(addedIdx) else 0L
+                            val modRaw = if (modIdx >= 0 && !cursor.isNull(modIdx)) cursor.getLong(modIdx) else 0L
+                            val relPath = if (relIdx >= 0 && !cursor.isNull(relIdx)) cursor.getString(relIdx) else null
 
+                            val defaultSubfolder = if (isImagesTable) "DCIM/Camera" else "Download"
                             val fullPath = when {
                                 !rawDataPath.isNullOrBlank() && rawDataPath.startsWith("/") -> rawDataPath
                                 !relPath.isNullOrBlank() -> "$mountPrefix/${relPath.trimStart('/')}$displayName"
-                                else -> "$mountPrefix/Download/$displayName"
+                                else -> "$mountPrefix/$defaultSubfolder/$displayName"
                             }
 
                             if (items.containsKey(fullPath)) continue
 
+                            val rawSize = if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) cursor.getLong(sizeIdx) else 0L
+                            val diskFile = File(fullPath)
+                            val size = when {
+                                rawSize > 0L -> rawSize
+                                diskFile.exists() && diskFile.length() > 0L -> diskFile.length()
+                                isImagesTable && rowId >= 0L -> 1024L
+                                else -> 0L
+                            }
+                            if (size <= 0L) continue
+
                             val resolvedMime = mime ?: MimeTypeMap.getSingleton()
                                 .getMimeTypeFromExtension(ext.lowercase(Locale.ROOT))
-                                ?: "application/octet-stream"
+                                ?: if (isImagesTable) "image/jpeg" else "application/octet-stream"
 
-                            val createdMs = if (addedSec > 0L) addedSec * 1000L else System.currentTimeMillis()
-                            val modifiedMs = if (modSec > 0L) modSec * 1000L else createdMs
+                            val diskModifiedMs = if (diskFile.exists()) diskFile.lastModified() else 0L
+                            val createdMs = normalizeEpochMillis(addedRaw, diskModifiedMs)
+                            val modifiedMs = maxOf(
+                                normalizeEpochMillis(modRaw, createdMs),
+                                createdMs
+                            )
 
                             items[fullPath] = PhoneFileItem(
                                 id = fullPath,
@@ -556,7 +618,7 @@ class PhoneFileScannerRepository(private val context: Context) {
                                 modifiedAtMillis = modifiedMs,
                                 storageLocation = storageLoc,
                                 volumeLabel = volumeLabel,
-                                category = FileCategory.fromExtension(ext, resolvedMime),
+                                category = if (isImagesTable) FileCategory.IMAGE else FileCategory.fromExtension(ext, resolvedMime),
                                 mimeType = resolvedMime,
                                 contentUri = rowContentUri,
                                 isSampleFile = false
@@ -569,6 +631,14 @@ class PhoneFileScannerRepository(private val context: Context) {
             }
         }
         return items.values.toList()
+    }
+
+    private fun normalizeEpochMillis(rawTimestamp: Long, fallbackMs: Long): Long {
+        if (rawTimestamp <= 0L) {
+            return if (fallbackMs > 0L) fallbackMs else System.currentTimeMillis()
+        }
+        // Timestamps > 100_000_000_000 are already in milliseconds; smaller positive values are Unix epoch seconds
+        return if (rawTimestamp > 100_000_000_000L) rawTimestamp else rawTimestamp * 1000L
     }
 
     private fun buildSampleStorageFiles(
@@ -706,8 +776,10 @@ class PhoneFileScannerRepository(private val context: Context) {
     }
 
     companion object {
-        private const val MAX_WALKED_FILES = 2500
-        private const val MAX_MEDIASTORE_FILES = 2500
+        private const val MAX_WALKED_FILES = 3000
+        private const val MAX_FILES_PER_ROOT = 500
+        private const val MAX_MEDIASTORE_FILES = 3000
+        private const val MAX_ROWS_PER_MEDIASTORE_URI = 800
 
         private val SKIPPED_DIR_NAMES = setOf(
             "cache",

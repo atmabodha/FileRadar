@@ -208,17 +208,20 @@ class FileFinderViewModel(application: Application) : AndroidViewModel(applicati
 
         indexingJob = viewModelScope.launch(Dispatchers.Default) {
             val allFiles = _uiState.value.allFiles
-            // Prioritize PDFs, Documents, and Images, capped at 60 files so background indexing finishes rapidly
+            // Prioritize real phone files over sample files, images/PDFs/documents first, and newest modified files first
             val filesToIndex = allFiles
-                .sortedBy { file ->
-                    when (file.category) {
-                        FileCategory.PDF -> 0
-                        FileCategory.DOCUMENT, FileCategory.CODE_DATA -> 1
-                        FileCategory.IMAGE -> 2
-                        else -> 3
-                    }
-                }
-                .take(60)
+                .sortedWith(
+                    compareBy<PhoneFileItem> { it.isSampleFile }
+                        .thenBy { file ->
+                            when (file.category) {
+                                FileCategory.IMAGE, FileCategory.PDF -> 0
+                                FileCategory.DOCUMENT, FileCategory.CODE_DATA -> 1
+                                else -> 2
+                            }
+                        }
+                        .thenByDescending { it.modifiedAtMillis }
+                )
+                .take(150)
 
             val chunkSize = _uiState.value.aiSettings.chunkSizeTokens
             val overlap = _uiState.value.aiSettings.chunkOverlapTokens

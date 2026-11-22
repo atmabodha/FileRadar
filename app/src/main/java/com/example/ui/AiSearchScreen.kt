@@ -37,6 +37,7 @@ import androidx.compose.material.icons.filled.DriveFileRenameOutline
 import androidx.compose.material.icons.filled.Forum
 import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.Psychology
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Terminal
@@ -44,6 +45,7 @@ import androidx.compose.material.icons.filled.ViewCarousel
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilledTonalButton
@@ -138,6 +140,10 @@ fun AiSearchScreen(
     onShareFile: (PhoneFileItem) -> Unit,
     onOpenPdfChat: ((PhoneFileItem) -> Unit)? = null,
     onOpenImageOcrScanner: () -> Unit = {},
+    isScanning: Boolean = false,
+    hasAllFilesAccess: Boolean = true,
+    onRescan: () -> Unit = {},
+    onGrantAllFilesAccess: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     // Graceful degradation when Master AI Kill Switch is OFF
@@ -155,6 +161,10 @@ fun AiSearchScreen(
             onFileClicked = onFileClicked,
             onCopyPath = onCopyPath,
             onShareFile = onShareFile,
+            isScanning = isScanning,
+            hasAllFilesAccess = hasAllFilesAccess,
+            onRescan = onRescan,
+            onGrantAllFilesAccess = onGrantAllFilesAccess,
             modifier = modifier
         )
         return
@@ -189,7 +199,9 @@ fun AiSearchScreen(
                             Text(
                                 text = "On-Device AI Intelligence",
                                 style = MaterialTheme.typography.titleLarge,
-                                color = MaterialTheme.colorScheme.onBackground
+                                color = MaterialTheme.colorScheme.onBackground,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
                         }
                         Text(
@@ -199,28 +211,117 @@ fun AiSearchScreen(
                         )
                     }
 
-                    FilledTonalButton(
-                        onClick = onOpenImageOcrScanner,
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
-                        modifier = Modifier
-                            .height(40.dp)
-                            .testTag("ai_open_image_ocr_scanner_button")
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.DocumentScanner,
-                            contentDescription = "Scan Text (OCR)",
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = "Scan Text (OCR)",
-                            style = MaterialTheme.typography.labelLarge,
-                            fontWeight = FontWeight.SemiBold
-                        )
+                        FilledTonalButton(
+                            onClick = onOpenImageOcrScanner,
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                            modifier = Modifier
+                                .height(40.dp)
+                                .testTag("ai_open_image_ocr_scanner_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.DocumentScanner,
+                                contentDescription = "Scan Text (OCR)",
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "Scan Text (OCR)",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+
+                        IconButton(
+                            onClick = onRescan,
+                            enabled = !isScanning,
+                            modifier = Modifier
+                                .size(40.dp)
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.surface)
+                                .testTag("ai_rescan_button")
+                        ) {
+                            if (isScanning) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(18.dp),
+                                    strokeWidth = 2.dp,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            } else {
+                                Icon(
+                                    imageVector = Icons.Default.Refresh,
+                                    contentDescription = "Sync & rescan phone files and recent images",
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                        }
                     }
                 }
 
-                if (aiSettings.isIndexingPipelineRunning) {
+                if (!hasAllFilesAccess) {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = MaterialTheme.shapes.medium,
+                        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.6f),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.secondary.copy(alpha = 0.7f))
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .padding(end = 8.dp)
+                            ) {
+                                Text(
+                                    text = "Full Storage Scan Required",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                Text(
+                                    text = "Allow access to index all recent photos, screenshots & PDFs on your phone.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+
+                            Surface(
+                                onClick = onGrantAllFilesAccess,
+                                shape = MaterialTheme.shapes.small,
+                                color = MaterialTheme.colorScheme.secondary,
+                                modifier = Modifier
+                                    .minimumInteractiveComponentSize()
+                                    .testTag("ai_grant_all_files_access_button")
+                            ) {
+                                Text(
+                                    text = "Grant Access",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = MaterialTheme.colorScheme.onSecondary,
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+
+                if (isScanning) {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        Text(
+                            text = "Syncing recent phone images & storage files…",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                } else if (aiSettings.isIndexingPipelineRunning) {
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                         Text(
@@ -680,6 +781,10 @@ private fun MasterAiDisabledFallbackView(
     onFileClicked: (PhoneFileItem) -> Unit,
     onCopyPath: (String) -> Unit,
     onShareFile: (PhoneFileItem) -> Unit,
+    isScanning: Boolean = false,
+    hasAllFilesAccess: Boolean = true,
+    onRescan: () -> Unit = {},
+    onGrantAllFilesAccess: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var fallbackQuery by remember { mutableStateOf("") }
@@ -690,7 +795,7 @@ private fun MasterAiDisabledFallbackView(
             allFiles.filter { it.category == selectedAiCategory }
         }
         val q = fallbackQuery.trim().lowercase(Locale.ROOT)
-        val matched = if (q.isEmpty()) categoryFiltered.take(20)
+        val matched = if (q.isEmpty()) categoryFiltered.take(300)
         else categoryFiltered.filter { it.name.lowercase(Locale.ROOT).contains(q) }
         val comparator: Comparator<PhoneFileItem> = when (selectedAiSortField) {
             AiSortField.RELEVANCE, AiSortField.MODIFIED_DATE ->
@@ -732,20 +837,52 @@ private fun MasterAiDisabledFallbackView(
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Row(
+                        modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.PowerSettingsNew,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.secondary
-                        )
-                        Text(
-                            text = "Master AI Kill Switch Active",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.PowerSettingsNew,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.secondary
+                            )
+                            Text(
+                                text = "Master AI Kill Switch Active",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+
+                        IconButton(
+                            onClick = onRescan,
+                            enabled = !isScanning,
+                            modifier = Modifier
+                                .size(38.dp)
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.surface)
+                                .testTag("ai_fallback_rescan_button")
+                        ) {
+                            if (isScanning) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(16.dp),
+                                    strokeWidth = 2.dp,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            } else {
+                                Icon(
+                                    imageVector = Icons.Default.Refresh,
+                                    contentDescription = "Sync & rescan phone files",
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
+                        }
                     }
                     Text(
                         text = "All background OCR, vector embedding, and LLM inference are disabled to conserve battery. Gracefully degraded to lightweight filename-only search.",
@@ -759,6 +896,55 @@ private fun MasterAiDisabledFallbackView(
                             .testTag("reenable_master_ai_button")
                     ) {
                         Text("Re-Enable On-Device AI Pipeline")
+                    }
+                }
+            }
+        }
+
+        if (!hasAllFilesAccess) {
+            item {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = MaterialTheme.shapes.medium,
+                    color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.6f),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.secondary.copy(alpha = 0.7f))
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(end = 8.dp)
+                        ) {
+                            Text(
+                                text = "Full Storage Scan Required",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = "Allow access to scan all recent photos, PDFs & files.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Surface(
+                            onClick = onGrantAllFilesAccess,
+                            shape = MaterialTheme.shapes.small,
+                            color = MaterialTheme.colorScheme.secondary,
+                            modifier = Modifier.minimumInteractiveComponentSize()
+                        ) {
+                            Text(
+                                text = "Grant Access",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.onSecondary,
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                            )
+                        }
                     }
                 }
             }
@@ -838,6 +1024,7 @@ private fun SemanticSearchInputSection(
     onQueryChange: (String) -> Unit
 ) {
     val sampleQueries = listOf(
+        "recent phone images & photos",
         "receipt for monitor or cloud hosting",
         "flight or train pass to Tokyo",
         "photo of sunset or beach",

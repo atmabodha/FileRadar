@@ -94,7 +94,9 @@ import androidx.compose.ui.window.DialogProperties
 import com.example.R
 import com.example.model.PhoneFileItem
 import com.example.pdfextractor.HybridPdfExtractor
+import com.example.pdfextractor.model.DocumentExtractionResult
 import com.example.pdfextractor.model.ExtractedPage
+import com.example.pdfextractor.model.ExtractionConfig
 import com.example.pdfextractor.model.ExtractionSource
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -195,11 +197,14 @@ fun FullScreenPdfReaderDialog(
     var pageCount by remember(file.id) { mutableIntStateOf(1) }
     var isPreparingDocument by remember(file.id) { mutableStateOf(true) }
     var isTextMode by remember(file.id) { mutableStateOf(false) }
+    var forceVisualOcrMode by remember(file.id) { mutableStateOf(false) }
+    var showExecutiveSummaryCard by remember(file.id) { mutableStateOf(true) }
     var textFontSizeSp by remember(file.id) { mutableFloatStateOf(15f) }
     var zoomScale by remember(file.id) { mutableFloatStateOf(1f) }
+    var extractionResultState by remember(file.id) { mutableStateOf<DocumentExtractionResult?>(null) }
     var extractedPages by remember(file.id) { mutableStateOf<List<ExtractedPage>>(emptyList()) }
     var isExtractingText by remember(file.id) { mutableStateOf(false) }
-    var extractionProgressText by remember(file.id) { mutableStateOf("Extracting text (PDFBox + ML Kit OCR)…") }
+    var extractionProgressText by remember(file.id) { mutableStateOf("Extracting text (PDFBox + ML Kit Visual OCR)…") }
     val hybridExtractor = remember(context) { HybridPdfExtractor(context.applicationContext) }
 
     val activeVisiblePage by remember {
@@ -219,18 +224,29 @@ fun FullScreenPdfReaderDialog(
         isPreparingDocument = false
     }
 
-    // Extract text via HybridPdfExtractor (Stage 1: PDFBox digital text -> Stage 2: PdfRenderer + ML Kit OCR)
-    LaunchedEffect(file.id, isTextMode, pageCount) {
-        if (isTextMode && extractedPages.isEmpty() && !isExtractingText) {
+    // Extract text via HybridPdfExtractor (Smart Hybrid Fusion OR Full Visual ML Kit OCR)
+    LaunchedEffect(file.id, isTextMode, forceVisualOcrMode, pageCount) {
+        if (isTextMode) {
             isExtractingText = true
+            val config = ExtractionConfig(
+                enableOcrFallback = true,
+                forceOcrAllPages = forceVisualOcrMode,
+                smartVisualOcrFusion = true
+            )
             val result = withContext(Dispatchers.IO) {
                 hybridExtractor.extractForPhoneFile(
                     file = file,
+                    config = config,
                     onPageProgress = { current, total ->
-                        extractionProgressText = "Extracting Page $current of $total (PDFBox + ML Kit OCR)…"
+                        extractionProgressText = if (forceVisualOcrMode) {
+                            "Visual OCR Mode: Scanning Page $current of $total via ML Kit Vision…"
+                        } else {
+                            "Extracting Page $current of $total (Smart Hybrid PDFBox + Visual OCR)…"
+                        }
                     }
                 )
             }
+            extractionResultState = result
             extractedPages = result.pages
             isExtractingText = false
         }
@@ -396,7 +412,7 @@ fun FullScreenPdfReaderDialog(
                     }
                 }
 
-                // Secondary Toolbar: Zoom controls in Page View OR Font Size controls in Text View
+                // Secondary Toolbar: Zoom controls in Page View OR Visual OCR + Summary + Font Size controls in Text View
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -406,11 +422,37 @@ fun FullScreenPdfReaderDialog(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     if (isTextMode) {
-                        Text(
-                            text = "Extracted PDF Text ($pageCount ${if (pageCount == 1) "page" else "pages"})",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = Color.White.copy(alpha = 0.85f)
-                        )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            TextButton(
+                                onClick = { forceVisualOcrMode = !forceVisualOcrMode },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                modifier = Modifier.testTag("pdf_reader_visual_ocr_toggle")
+                            ) {
+                                Text(
+                                    text = if (forceVisualOcrMode) "Visual OCR: ON" else "Force Visual OCR",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (forceVisualOcrMode) Color(0xFFFBBF24) else Color(0xFF67E8F9)
+                                )
+                            }
+
+                            TextButton(
+                                onClick = { showExecutiveSummaryCard = !showExecutiveSummaryCard },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                modifier = Modifier.testTag("pdf_reader_summary_toggle")
+                            ) {
+                                Text(
+                                    text = if (showExecutiveSummaryCard) "Hide Summary" else "Show Summary",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color(0xFF34D399)
+                                )
+                            }
+                        }
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -525,6 +567,16 @@ fun FullScreenPdfReaderDialog(
                                 )
                             }
                         } else {
+                            val currentResult = extractionResultState
+                            val executiveSummaryText = remember(currentResult, file.name) {
+                                currentResult?.let {
+                                    buildStructuredExecutiveSummary(
+                                        fileName = file.name,
+                                        extraction = it
+                                    )
+                                }
+                            }
+
                             LazyColumn(
                                 modifier = Modifier
                                     .fillMaxSize()
@@ -532,6 +584,58 @@ fun FullScreenPdfReaderDialog(
                                 contentPadding = PaddingValues(16.dp),
                                 verticalArrangement = Arrangement.spacedBy(16.dp)
                             ) {
+                                if (showExecutiveSummaryCard && !executiveSummaryText.isNullOrBlank()) {
+                                    item(key = "pdf_reader_executive_summary_card") {
+                                        Surface(
+                                            shape = MaterialTheme.shapes.medium,
+                                            color = Color(0xFFECFDF5),
+                                            border = BorderStroke(1.5.dp, Color(0xFF10B981)),
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .testTag("pdf_reader_executive_summary_card")
+                                        ) {
+                                            Column(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .padding(18.dp),
+                                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                                            ) {
+                                                Row(
+                                                    modifier = Modifier.fillMaxWidth(),
+                                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                                    verticalAlignment = Alignment.CenterVertically
+                                                ) {
+                                                    Text(
+                                                        text = "AI Structured Document Summary",
+                                                        style = MaterialTheme.typography.titleSmall,
+                                                        fontWeight = FontWeight.Bold,
+                                                        color = Color(0xFF065F46)
+                                                    )
+                                                    Surface(
+                                                        shape = MaterialTheme.shapes.extraSmall,
+                                                        color = Color(0xFFD1FAE5)
+                                                    ) {
+                                                        Text(
+                                                            text = if (forceVisualOcrMode) "Visual OCR Mode" else "Smart Hybrid Parser",
+                                                            style = MaterialTheme.typography.labelSmall,
+                                                            fontWeight = FontWeight.SemiBold,
+                                                            color = Color(0xFF047857),
+                                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                        )
+                                                    }
+                                                }
+                                                HorizontalDivider(color = Color(0xFFA7F3D0))
+                                                Text(
+                                                    text = executiveSummaryText,
+                                                    fontSize = (textFontSizeSp - 1f).coerceAtLeast(12f).sp,
+                                                    lineHeight = ((textFontSizeSp - 1f).coerceAtLeast(12f) * 1.42f).sp,
+                                                    color = Color(0xFF064E3B)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+
                                 itemsIndexed(extractedPages) { idx, pageItem ->
                                     Surface(
                                         shape = MaterialTheme.shapes.medium,
@@ -562,7 +666,7 @@ fun FullScreenPdfReaderDialog(
                                                 Spacer(modifier = Modifier.width(8.dp))
                                                 Surface(
                                                     shape = MaterialTheme.shapes.extraSmall,
-                                                    color = if (pageItem.source == ExtractionSource.ML_KIT_OCR) {
+                                                    color = if (pageItem.source == ExtractionSource.ML_KIT_OCR || pageItem.source == ExtractionSource.FUSED_HYBRID_OCR) {
                                                         Color(0xFFFEF3C7)
                                                     } else {
                                                         Color(0xFFE0F2FE)
@@ -571,7 +675,7 @@ fun FullScreenPdfReaderDialog(
                                                     Text(
                                                         text = pageItem.source.badgeLabel,
                                                         style = MaterialTheme.typography.labelSmall,
-                                                        color = if (pageItem.source == ExtractionSource.ML_KIT_OCR) {
+                                                        color = if (pageItem.source == ExtractionSource.ML_KIT_OCR || pageItem.source == ExtractionSource.FUSED_HYBRID_OCR) {
                                                             Color(0xFFB45309)
                                                         } else {
                                                             Color(0xFF0369A1)
@@ -1131,18 +1235,20 @@ internal fun cleanAndSanitizePdfPageText(rawText: String): String {
 
 /**
  * Repairs lines where PDF kerning placed spaces between every single letter
- * (e.g., "P A T I E N T   R E P O R T" -> "PATIENT REPORT").
+ * (e.g., "P A T I E N T   R E P O R T" -> "PATIENT REPORT"), while never touching
+ * pipe-delimited table rows or single-digit table values.
  */
 private fun repairSpacedOutKerning(line: String): String {
+    if (line.contains('|')) return line
     val tokens = line.split(' ')
     if (tokens.size < 4) return line
-    val singleCharTokens = tokens.count { it.length == 1 && it[0].isLetterOrDigit() }
-    if (singleCharTokens.toFloat() / tokens.size.toFloat() < 0.75f) {
+    val singleLetterTokens = tokens.count { it.length == 1 && it[0].isLetter() }
+    if (singleLetterTokens.toFloat() / tokens.size.toFloat() < 0.75f) {
         return line
     }
     return buildString {
         for (token in tokens) {
-            if (token.length == 1 && token[0].isLetterOrDigit()) {
+            if (token.length == 1 && token[0].isLetter()) {
                 append(token)
             } else {
                 if (isNotEmpty() && last() != ' ') append(' ')
@@ -1155,19 +1261,20 @@ private fun repairSpacedOutKerning(line: String): String {
 
 /**
  * Cleans a single whitespace-delimited token and returns `null` if the token is garbled noise,
- * a leaked PDF operator, or high-density symbol soup.
+ * a leaked PDF operator, or high-density symbol soup, while preserving lab units, serial/invoice IDs,
+ * dates, prices, ranges, and table delimiters.
  */
 private fun sanitizePdfToken(rawToken: String): String? {
-    if (rawToken == "|") return "|"
+    if (rawToken == "|" || rawToken == ":" || rawToken == "/" || rawToken == "-") return rawToken
 
     val trimmed = rawToken.trim { ch ->
-        ch in "`~^|\\<>{}" || ch.code < 32
+        ch in "`~\\<>{}" || ch.code < 32
     }
     if (trimmed.isEmpty()) return null
 
     // Allow standard bullet, list, or table column markers
-    if (trimmed == "•" || trimmed == "-" || trimmed == "–") return "•"
-    if (trimmed == "<" || trimmed == ">") return trimmed
+    if (trimmed == "•" || trimmed == "-" || trimmed == "–" || trimmed == "—") return "•"
+    if (trimmed == "<" || trimmed == ">" || trimmed == "|") return trimmed
 
     // Reject leaked internal PDF/PostScript syntax keywords
     if (trimmed in pdfInternalOperatorRejectSet) return null
@@ -1176,7 +1283,7 @@ private fun sanitizePdfToken(rawToken: String): String? {
     // Reject runs of repeated symbols (e.g. "____", "=====", "*****", "~~~~~", ".....")
     if (repeatedSymbolRunRegex.matches(trimmed)) return null
 
-    // Reject tokens containing 2+ consecutive high-noise ASCII symbols (~ ` ^ | \ < > { } @ # $ % * _ = +)
+    // Reject tokens containing 2+ consecutive high-noise ASCII symbols (~ ` \ < > { } # * _)
     if (consecutiveJunkSymbolsRegex.containsMatchIn(trimmed)) return null
 
     val length = trimmed.length
@@ -1189,7 +1296,7 @@ private fun sanitizePdfToken(rawToken: String): String? {
         when {
             ch.isLetter() -> letters++
             ch.isDigit() -> digits++
-            ch in ".,;:!?'\"()-/$%&•+@|" -> standardPunct++
+            ch in ".,;:!?'\"()-/$%&•+@|<>^=[]" -> standardPunct++
             else -> noisySymbols++
         }
     }
@@ -1197,15 +1304,15 @@ private fun sanitizePdfToken(rawToken: String): String? {
     val alnum = letters + digits
     if (alnum == 0) return null
 
-    // If token has any noisy symbol and is short, or noisy symbols exceed 15% of token, drop it
-    if (noisySymbols > 0 && (length <= 4 || noisySymbols.toFloat() / length.toFloat() > 0.15f)) {
+    // If token has any noisy symbol and is short, or noisy symbols exceed 20% of token, drop it
+    if (noisySymbols > 0 && (length <= 4 || noisySymbols.toFloat() / length.toFloat() > 0.20f)) {
         return null
     }
 
-    // For tokens of length >= 3, require at least 55% alphanumeric characters
-    // (exempting clean numeric/currency/percentage tokens with zero noisy symbols like "5.2%." or "$1.50,")
-    val isCleanNumericPunct = digits >= 1 && noisySymbols == 0
-    if (!isCleanNumericPunct && length >= 3 && alnum.toFloat() / length.toFloat() < 0.55f) {
+    // For tokens of length >= 3, require at least 45% alphanumeric characters
+    // (exempting clean numeric/currency/percentage/unit tokens with zero noisy symbols like "5.2%.", "mL/min/1.73m2", "$1.50,")
+    val isCleanNumericOrUnitPunct = noisySymbols == 0 && (digits >= 1 || trimmed.contains('/'))
+    if (!isCleanNumericOrUnitPunct && length >= 3 && alnum.toFloat() / length.toFloat() < 0.45f) {
         return null
     }
 
@@ -1218,7 +1325,7 @@ private fun sanitizePdfToken(rawToken: String): String? {
     }
 
     // Detect unpronounceable consonant/symbol gibberish in long Latin tokens
-    if (letters >= 8 && digits == 0) {
+    if (letters >= 8 && digits == 0 && !trimmed.contains('/') && !trimmed.contains('-')) {
         val vowelCount = trimmed.count { it.lowercaseChar() in "aeiouy" }
         val nonLatinCount = trimmed.count { it.code > 127 && it.isLetter() }
         if (vowelCount == 0 && nonLatinCount == 0) {
@@ -1227,7 +1334,7 @@ private fun sanitizePdfToken(rawToken: String): String? {
     }
 
     // Reject excessively long unbroken non-URL strings (e.g. base64 or hex dumps)
-    if (length > 45 && !trimmed.startsWith("http", ignoreCase = true) && !trimmed.contains('/')) {
+    if (length > 64 && !trimmed.startsWith("http", ignoreCase = true) && !trimmed.contains('/') && !trimmed.contains('-')) {
         return null
     }
 
@@ -1235,7 +1342,8 @@ private fun sanitizePdfToken(rawToken: String): String? {
 }
 
 /**
- * Evaluates whether a reconstructed line is clean, human-readable text rather than garbled stream noise.
+ * Evaluates whether a reconstructed line is clean, human-readable text rather than garbled stream noise,
+ * while preserving table rows (` | `), key-value pairs (`Key: Value`), phone numbers, dates, and financial figures.
  */
 private fun isCleanReadableLine(line: String): Boolean {
     if (line.isBlank()) return false
@@ -1251,7 +1359,7 @@ private fun isCleanReadableLine(line: String): Boolean {
             ch.isLetter() -> letters++
             ch.isDigit() -> digits++
             ch == ' ' -> spaces++
-            ch in ".,;:!?'\"()-/$%&•+@|<>" -> cleanPunct++
+            ch in ".,;:!?'\"()-/$%&•+@|<>^=[]" -> cleanPunct++
             else -> otherChars++
         }
     }
@@ -1259,27 +1367,28 @@ private fun isCleanReadableLine(line: String): Boolean {
     val alnum = letters + digits
     if (alnum == 0) return false
 
-    // Allow short numeric page labels or list numbers (e.g. "1", "12", "Page 2")
-    if (line.length <= 4 && digits >= 1 && otherChars == 0) return true
+    // Allow short numeric page labels, list numbers, or short headers (e.g. "1", "12", "ID", "OK")
+    if (line.length <= 4 && alnum >= 1 && otherChars == 0) return true
 
     if (alnum < 2) return false
 
-    // Require at least 86% of the line to be letters, digits, spaces, or normal punctuation
+    // Require at least 82% of the line to be letters, digits, spaces, or normal punctuation
     val cleanRatio = (alnum + spaces + cleanPunct).toFloat() / line.length.toFloat()
-    if (cleanRatio < 0.86f) return false
+    if (cleanRatio < 0.82f) return false
 
-    // Require alphanumeric characters to outnumber punctuation/symbols by at least 2.5x
+    // Allow punctuation-rich table rows, dates, phone numbers, and units as long as noisy otherChars are low
     val totalSymbols = cleanPunct + otherChars
-    if (totalSymbols > 0 && alnum.toFloat() / totalSymbols.toFloat() < 2.2f) {
+    val minAlnumToSymbolRatio = if (line.contains('|') || line.contains(':') || digits >= 2) 0.85f else 1.5f
+    if (totalSymbols > 0 && alnum.toFloat() / totalSymbols.toFloat() < minAlnumToSymbolRatio) {
         return false
     }
 
-    // If the line has 5+ Latin letters, ensure it has a realistic vowel ratio (>= 14%) so shifted-ASCII consonant garble is rejected
+    // If the line has 6+ Latin letters, ensure it has a realistic vowel ratio (>= 12%) so shifted-ASCII consonant garble is rejected
     val latinLetters = line.count { it in 'A'..'Z' || it in 'a'..'z' }
-    if (latinLetters >= 5) {
+    if (latinLetters >= 6) {
         val vowels = line.count { it.lowercaseChar() in "aeiouy" }
         val vowelRatio = vowels.toFloat() / latinLetters.toFloat()
-        if (vowelRatio < 0.14f || vowelRatio > 0.88f) {
+        if (vowelRatio < 0.12f || vowelRatio > 0.90f) {
             return false
         }
     }
@@ -1290,11 +1399,11 @@ private fun isCleanReadableLine(line: String): Boolean {
 private val multiSpaceRegex = Regex(" {2,}")
 private val whitespaceRegex = Regex("\\s+")
 private val excessNewlinesRegex = Regex("\n{3,}")
-private val repeatedSymbolRunRegex = Regex("^[^a-zA-Z0-9]{2,}$|([_\\-=*~.#•])\\1{2,}")
-private val consecutiveJunkSymbolsRegex = Regex("[~`^|\\\\<>{}@#$%*_+=]{2,}")
+private val repeatedSymbolRunRegex = Regex("^[^a-zA-Z0-9]{3,}$|([_\\-=*~.#•])\\1{2,}")
+private val consecutiveJunkSymbolsRegex = Regex("[~`\\\\<>{}#*_]{2,}")
 private val pdfFontOrResourceTagRegex = Regex("^/[A-Za-z0-9_+\\-.]+$")
 private val validStructuredAlnumPunctRegex = Regex(
-    "^(\\$?[0-9]{1,3}(,[0-9]{3})*(\\.[0-9]+)?%?|v?[0-9]+(\\.[0-9]+)+|[0-9]{1,4}[/-][0-9]{1,2}[/-][0-9]{1,4}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}|[A-Za-z]+-[0-9]+|[0-9]+[A-Za-z]{1,4}|\\([0-9A-Za-z.,%-]+\\))[,.;:]?$"
+    "^(\\$?[0-9]{1,3}(,[0-9]{3})*(\\.[0-9]+)?%?|v?[0-9]+(\\.[0-9]+)+|[0-9]{1,4}[/-][0-9]{1,2}[/-][0-9]{1,4}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}|[A-Za-z0-9]+(-[A-Za-z0-9]+)+|[A-Za-z0-9.^+-]+(/[A-Za-z0-9.^+-]+)+|[0-9]+[A-Za-z]{1,6}|\\([0-9A-Za-z.,%/+-]+\\))[,.;:]?$"
 )
 
 private val pdfInternalOperatorRejectSet = setOf(

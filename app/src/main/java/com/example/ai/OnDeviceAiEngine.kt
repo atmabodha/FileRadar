@@ -173,13 +173,21 @@ class OnDeviceAiEngine(private val context: Context) {
         val compiledPresets = buildCompiledPresets(presetLabels)
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) {
-            return files.take(15).map { file ->
+            // Prioritize real phone files over sample files, and newest modified/captured files first
+            val orderedFiles = files.sortedWith(
+                compareBy<PhoneFileItem> { it.isSampleFile }
+                    .thenByDescending { it.modifiedAtMillis }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { it.name }
+            )
+            return orderedFiles.take(300).mapIndexed { index, file ->
                 val chunks = fileChunkStore[file.id].orEmpty()
                 val firstSnippet = chunks.firstOrNull()?.text
                     ?: extractFileTextContent(file, allowDiskRead = false)
+                val recencyDecay = (index * 0.0002f).coerceAtMost(0.05f)
+                val baseScore = if (!file.isSampleFile) 0.98f else 0.89f
                 SemanticSearchResult(
                     file = file,
-                    cosineSimilarity = 0.88f,
+                    cosineSimilarity = (baseScore - recencyDecay).coerceIn(0.75f, 0.99f),
                     matchedSnippet = firstSnippet.take(180),
                     matchedChunkIndex = 0,
                     totalFileChunks = chunks.size.coerceAtLeast(1),
@@ -192,12 +200,20 @@ class OnDeviceAiEngine(private val context: Context) {
         val queryTokens = tokenizeWords(cleanQuery)
         val results = mutableListOf<SemanticSearchResult>()
         var onDemandIndexedCount = 0
+        val nowMs = System.currentTimeMillis()
+        val thirtyDaysMs = 30L * 24L * 60L * 60L * 1000L
 
-        for (file in files) {
+        // Evaluate real device files and newest files first so on-demand indexing prioritizes them
+        val prioritizedFiles = files.sortedWith(
+            compareBy<PhoneFileItem> { it.isSampleFile }
+                .thenByDescending { it.modifiedAtMillis }
+        )
+
+        for (file in prioritizedFiles) {
             val existingChunks = fileChunkStore[file.id]
             val chunks: List<DocumentChunk> = if (existingChunks != null) {
                 existingChunks
-            } else if (onDemandIndexedCount < 60) {
+            } else if (onDemandIndexedCount < 100) {
                 onDemandIndexedCount++
                 indexSingleFile(file, 256, 30)
             } else {
@@ -217,6 +233,8 @@ class OnDeviceAiEngine(private val context: Context) {
 
             var bestScore = -1f
             var bestChunk: DocumentChunk? = null
+            val realDeviceBoost = if (!file.isSampleFile) 0.05f else 0f
+            val recencyBoost = if (nowMs - file.modifiedAtMillis in 0..thirtyDaysMs) 0.03f else 0f
 
             for (chunk in chunks) {
                 val vectorSim = cosineSimilarity(queryEmbedding, chunk.embedding)
@@ -224,7 +242,7 @@ class OnDeviceAiEngine(private val context: Context) {
                 val lexicalBoost = queryTokens.count { token ->
                     token.length >= 2 && chunkLower.contains(token)
                 } * 0.14f
-                val combinedScore = (vectorSim + lexicalBoost).coerceAtMost(0.99f)
+                val combinedScore = (vectorSim + lexicalBoost + realDeviceBoost + recencyBoost).coerceAtMost(0.99f)
                 if (combinedScore > bestScore) {
                     bestScore = combinedScore
                     bestChunk = chunk
@@ -245,7 +263,13 @@ class OnDeviceAiEngine(private val context: Context) {
             }
         }
 
-        return results.sortedByDescending { it.cosineSimilarity }.take(100)
+        return results
+            .sortedWith(
+                compareByDescending<SemanticSearchResult> { it.cosineSimilarity }
+                    .thenBy { it.file.isSampleFile }
+                    .thenByDescending { it.file.modifiedAtMillis }
+            )
+            .take(150)
     }
 
     /**
@@ -943,8 +967,26 @@ class OnDeviceAiEngine(private val context: Context) {
                 "High-definition video recording featuring 4K HDR aerial drone flyover of snow-capped Alps mountains, coastal beach cliffs at sunset, deep ocean ROV footage, and keynote demo."
             lower.contains("symphony") || lower.contains("rainforest") || lower.contains("podcast") || lower.contains("voicenote") ->
                 "Audio recording containing lossless 24-bit classical symphony master, rainforest thunder nature ambience, systems engineering podcast episode, and kernel meeting voice note."
+            file.category == FileCategory.IMAGE -> {
+                val pathLower = file.fullPath.lowercase(Locale.ROOT)
+                val sourceHint = when {
+                    pathLower.contains("ocr_captures") || lower.startsWith("ocr_capture") ->
+                        "In-app camera OCR text capture photo taken recently on phone."
+                    pathLower.contains("screenshot") || lower.contains("screenshot") ->
+                        "Mobile phone screen capture screenshot image saved in Pictures/Screenshots."
+                    pathLower.contains("dcim") || pathLower.contains("camera") || lower.startsWith("img_") || lower.startsWith("pxl_") || lower.startsWith("dsc_") ->
+                        "Recent phone camera photograph and gallery photo captured in DCIM/Camera."
+                    pathLower.contains("whatsapp") || pathLower.contains("telegram") ->
+                        "Shared messaging photo and image received on phone."
+                    pathLower.contains("download") ->
+                        "Downloaded image picture saved in phone Downloads."
+                    else ->
+                        "Phone gallery photo, picture, and visual image file."
+                }
+                "$sourceHint Recent phone image photo picture (${file.formattedModifiedDate()}) located in ${file.fullPath} on ${file.volumeLabel} (.${file.extension})."
+            }
             else ->
-                "Indexed user file located in ${file.fullPath} on ${file.volumeLabel}. Contains ${file.category.displayName} data with extension .${file.extension}."
+                "Indexed user file (${file.formattedModifiedDate()}) located in ${file.fullPath} on ${file.volumeLabel}. Contains ${file.category.displayName} data with extension .${file.extension}."
         }
 
         return "$baseMeta $specificContext"
@@ -1036,14 +1078,14 @@ class OnDeviceAiEngine(private val context: Context) {
             setOf("invoice", "receipt", "bill", "payment", "cost", "price", "statement", "bank", "audit", "financial", "ledger", "expense", "monitor", "cloud", "hosting"),
             setOf("tax", "federal", "property", "return", "transcript", "irs", "assessment", "deduction", "lease", "insurance", "policy"),
             setOf("travel", "flight", "boarding", "pass", "tokyo", "japan", "kyoto", "hotel", "ryokan", "rail", "train", "itinerary", "passport", "visa", "trip", "airport"),
-            setOf("photo", "image", "picture", "sunset", "beach", "coast", "coastal", "ocean", "sea", "bridge", "goldengate", "outdoor", "landscape", "panorama", "fjord", "scenic"),
+            setOf("photo", "photos", "image", "images", "picture", "pictures", "recent", "camera", "gallery", "dcim", "img", "pxl", "capture", "sunset", "beach", "coast", "coastal", "ocean", "sea", "bridge", "goldengate", "outdoor", "landscape", "panorama", "fjord", "scenic", "jpg", "jpeg", "png", "webp", "heic"),
             setOf("night", "sky", "star", "milkyway", "aurora", "astrophotography", "raw", "dng", "exposure", "camera", "lens"),
             setOf("video", "clip", "movie", "drone", "flyover", "alps", "glacier", "mountain", "4k", "hdr", "footage", "keynote", "demo", "rehearsal"),
             setOf("audio", "music", "song", "podcast", "voice", "note", "recording", "meeting", "symphony", "flac", "rainforest", "thunder", "sound"),
             setOf("book", "handbook", "textbook", "manual", "guide", "reference", "architecture", "clean", "kotlin", "coroutines", "linux", "kernel", "distributed", "system"),
             setOf("hardware", "schematic", "pcb", "keyboard", "sensor", "optical", "solar", "inverter", "battery", "thermal", "calibration", "firmware"),
             setOf("ai", "ml", "npu", "transformer", "attention", "quantization", "gemma", "model", "research", "paper", "survey", "vector"),
-            setOf("screenshot", "screen", "monitor", "terminal", "cpu", "memory", "ram", "graph", "benchmark", "latency", "ui"),
+            setOf("screenshot", "screenshots", "screen", "monitor", "terminal", "cpu", "memory", "ram", "graph", "benchmark", "latency", "ui"),
             setOf("work", "roadmap", "proposal", "okr", "presentation", "strategy", "consulting", "project", "client", "report"),
             setOf("backup", "archive", "zip", "tar", "snapshot", "dotfiles", "source", "legacy", "compressed", "bundle"),
             setOf("apk", "android", "app", "package", "sdk", "platform", "tools", "maps", "analyzer", "network"),

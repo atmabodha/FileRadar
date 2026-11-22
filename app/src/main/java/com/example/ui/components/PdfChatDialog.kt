@@ -81,6 +81,7 @@ import com.example.pdfextractor.TextChunker
 import com.example.pdfextractor.TextNormalizer
 import com.example.pdfextractor.model.DocumentExtractionResult
 import com.example.pdfextractor.model.ExtractedPage
+import com.example.pdfextractor.model.ExtractionConfig
 import com.example.pdfextractor.model.ExtractionSource
 import com.example.pdfextractor.model.TextChunk
 import com.google.firebase.Firebase
@@ -1004,17 +1005,18 @@ private fun synthesizeLocalGemmaResponse(
     question: String,
     conversationalQuery: ResolvedConversationalQuery? = null
 ): String {
-    val lowerQ = (conversationalQuery?.effectiveQueryText ?: question).lowercase(Locale.ROOT)
     val pages = extraction.pages
     val totalPages = pages.size.coerceAtLeast(1)
-    val ocrPageCount = pages.count { it.source == ExtractionSource.ML_KIT_OCR }
+    val ocrPageCount = pages.count {
+        it.source == ExtractionSource.ML_KIT_OCR || it.source == ExtractionSource.FUSED_HYBRID_OCR
+    }
     val digitalPageCount = pages.count { it.source == ExtractionSource.PDF_TEXT }
 
     val provenanceSummary = when {
         ocrPageCount > 0 && digitalPageCount > 0 ->
-            "$totalPages pages ($digitalPageCount digital text + $ocrPageCount ML Kit OCR)"
+            "$totalPages pages ($digitalPageCount digital text + $ocrPageCount Visual/Fused OCR)"
         ocrPageCount > 0 ->
-            "$totalPages ${if (totalPages == 1) "page" else "pages"} (extracted via on-device ML Kit OCR)"
+            "$totalPages ${if (totalPages == 1) "page" else "pages"} (extracted via on-device ML Kit Visual OCR)"
         else ->
             "$totalPages ${if (totalPages == 1) "page" else "pages"} (extracted via PDFBox digital text layer)"
     }
@@ -1022,11 +1024,17 @@ private fun synthesizeLocalGemmaResponse(
     val rawLowerQ = question.lowercase(Locale.ROOT)
     val isSummaryQuery = rawLowerQ.contains("summarize") || rawLowerQ.contains("summary") ||
         rawLowerQ.contains("overview") || rawLowerQ.contains("what is this") ||
-        rawLowerQ.contains("about") || rawLowerQ.contains("tl;dr") || rawLowerQ.contains("main points")
+        rawLowerQ.contains("about") || rawLowerQ.contains("tl;dr") || rawLowerQ.contains("main points") ||
+        rawLowerQ.contains("executive")
 
     val isNumbersOrDatesQuery = rawLowerQ.contains("key numbers") || rawLowerQ.contains("dates & totals") ||
         rawLowerQ.contains("numbers, dates") || rawLowerQ.contains("all numbers") ||
-        rawLowerQ.contains("amounts") || rawLowerQ.contains("figures")
+        rawLowerQ.contains("amounts") || rawLowerQ.contains("figures") ||
+        rawLowerQ.contains("metrics")
+
+    val isActionItemsOrAnomaliesQuery = rawLowerQ.contains("action items") || rawLowerQ.contains("anomalies") ||
+        rawLowerQ.contains("recommendations") || rawLowerQ.contains("next steps") ||
+        rawLowerQ.contains("warnings") || rawLowerQ.contains("abnormal")
 
     val isFindingsQuery = rawLowerQ.contains("main findings") || rawLowerQ.contains("findings & values") ||
         rawLowerQ.contains("key findings") || rawLowerQ.contains("conclusions") ||
@@ -1035,56 +1043,44 @@ private fun synthesizeLocalGemmaResponse(
     val isPageOutlineQuery = rawLowerQ.contains("list all pages") || rawLowerQ.contains("pages & sections") ||
         rawLowerQ.contains("table of contents") || rawLowerQ.contains("sections")
 
-    // 1. Executive Document Summary Mode
+    // 1. Comprehensive Multi-Section Executive Document Summary Mode
     if (isSummaryQuery) {
-        val topTopics = extractTopDocumentKeyphrases(extraction, limit = 6)
-        val salientSentences = extractSalientSummarySentences(extraction, maxSentences = 5)
-        val keyMetrics = extractQuantitativeFacts(extraction, maxFacts = 5)
-        val allSections = pages.flatMap { it.detectedSections }.distinct().take(6)
+        return buildStructuredExecutiveSummary(
+            fileName = file.name,
+            extraction = extraction,
+            provenanceSummary = provenanceSummary
+        )
+    }
 
+    // 2. Action Items, Recommendations & Flagged Anomalies Mode
+    if (isActionItemsOrAnomaliesQuery) {
+        val actionItems = extractActionItemsAndAnomalies(extraction, maxItems = 8)
+        val keyValues = extractStructuredKeyValuePairs(extraction, maxPairs = 6)
         return buildString {
-            append("Executive Summary — ${file.name}\n")
-            append("• Scope: $provenanceSummary • ${extraction.chunks.size} indexed sentence chunks")
-            if (extraction.removedRunningHeadersCount > 0) {
-                append(" (${extraction.removedRunningHeadersCount} repeated headers/footers stripped)")
-            }
-            append(".\n")
-            if (allSections.isNotEmpty()) {
-                append("• Detected Sections: ${allSections.joinToString(" • ")}\n")
-            }
-            if (topTopics.isNotEmpty()) {
-                append("• Core Topics: ${topTopics.joinToString(", ")}\n")
-            }
-            append('\n')
-
-            if (salientSentences.isNotEmpty()) {
-                append("Key Highlights & Takeaways:\n")
-                salientSentences.forEach { (pageNum, sentence) ->
+            append("Action Items, Recommendations & Flagged Alerts — ${file.name} ($provenanceSummary):\n\n")
+            if (actionItems.isNotEmpty()) {
+                actionItems.forEach { (pageNum, item) ->
+                    append("• [Page $pageNum] $item\n")
+                }
+            } else {
+                val salient = extractSalientSummarySentences(extraction, maxSentences = 4)
+                salient.forEach { (pageNum, sentence) ->
                     append("• [Page $pageNum] $sentence\n")
                 }
-                append('\n')
             }
-
-            if (keyMetrics.isNotEmpty()) {
-                append("Notable Figures, Dates & Measurements:\n")
-                keyMetrics.forEach { (pageNum, fact) ->
-                    append("• [Page $pageNum] $fact\n")
+            if (keyValues.isNotEmpty()) {
+                append("\nStructured Fields & Reference Values:\n")
+                keyValues.forEach { (pageNum, pair) ->
+                    append("• [Page $pageNum] $pair\n")
                 }
-                append('\n')
-            }
-
-            append("Page-by-Page Breakdown:\n")
-            pages.take(8).forEach { page ->
-                val pageDigest = summarizeSinglePage(page)
-                val badge = if (page.source == ExtractionSource.ML_KIT_OCR) " [OCR]" else ""
-                append("• Page ${page.pageNumber}$badge: $pageDigest\n")
             }
         }.trim()
     }
 
-    // 2. Key Numbers, Dates & Totals Mode
+    // 3. Key Numbers, Dates & Totals Mode
     if (isNumbersOrDatesQuery) {
         val quantFacts = extractQuantitativeFacts(extraction, maxFacts = 10)
+        val keyValues = extractStructuredKeyValuePairs(extraction, maxPairs = 6)
         return buildString {
             append("Key Numbers, Dates & Totals in ${file.name} ($provenanceSummary):\n\n")
             if (quantFacts.isNotEmpty()) {
@@ -1099,35 +1095,51 @@ private fun synthesizeLocalGemmaResponse(
             } else {
                 append("No explicit numerical totals, currency amounts, or dates were detected in the extracted text of ${file.name}.")
             }
+            if (keyValues.isNotEmpty()) {
+                append("\nExtracted Key-Value Fields:\n")
+                keyValues.forEach { (pageNum, kv) ->
+                    append("• [Page $pageNum] $kv\n")
+                }
+            }
         }.trim()
     }
 
-    // 3. Main Findings & Values Mode
+    // 4. Main Findings & Values Mode
     if (isFindingsQuery) {
+        val docCategory = classifyDocumentCategory(file.name, extraction)
         val salient = extractSalientSummarySentences(extraction, maxSentences = 6)
-        val quantFacts = extractQuantitativeFacts(extraction, maxFacts = 4)
+        val quantFacts = extractQuantitativeFacts(extraction, maxFacts = 5)
+        val actionItems = extractActionItemsAndAnomalies(extraction, maxItems = 4)
         return buildString {
-            append("Main Findings & Values — ${file.name} ($provenanceSummary):\n\n")
+            append("Main Findings & Values — ${file.name}\n")
+            append("• Document Category: $docCategory ($provenanceSummary)\n\n")
             if (salient.isNotEmpty()) {
+                append("Core Findings:\n")
                 salient.forEach { (pageNum, sentence) ->
                     append("• [Page $pageNum] $sentence\n")
                 }
             }
             if (quantFacts.isNotEmpty()) {
-                append("\nKey Recorded Values:\n")
+                append("\nKey Recorded Values & Metrics:\n")
                 quantFacts.forEach { (pageNum, fact) ->
                     append("• [Page $pageNum] $fact\n")
+                }
+            }
+            if (actionItems.isNotEmpty()) {
+                append("\nConclusions, Alerts & Next Steps:\n")
+                actionItems.forEach { (pageNum, item) ->
+                    append("• [Page $pageNum] $item\n")
                 }
             }
         }.trim()
     }
 
-    // 4. Page & Section Outline Mode
+    // 5. Page & Section Outline Mode
     if (isPageOutlineQuery) {
         return buildString {
             append("Pages & Sections Outline — ${file.name} ($provenanceSummary):\n\n")
             pages.forEach { page ->
-                val sourceTag = if (page.source == ExtractionSource.ML_KIT_OCR) "On-Device OCR" else "Digital Text"
+                val sourceTag = page.source.badgeLabel
                 val heading = extractPageHeadingOrTitle(page)
                 val digest = summarizeSinglePage(page)
                 append("• Page ${page.pageNumber} ($sourceTag) — $heading\n")
@@ -1141,7 +1153,7 @@ private fun synthesizeLocalGemmaResponse(
         }.trim()
     }
 
-    // 5. Focused Question Answering over MMR-Ranked Sentence Chunks + Conversational Follow-up Context
+    // 6. Focused Question Answering over MMR-Ranked Sentence Chunks + Conversational Follow-up Context
     val bestMatches = topPassages.filter { it.score > 0.35 }.ifEmpty { topPassages.take(3) }
     return if (bestMatches.isNotEmpty()) {
         val primary = bestMatches.first()
@@ -1192,6 +1204,228 @@ private fun synthesizeLocalGemmaResponse(
             }
         }.trim()
     }
+}
+
+/**
+ * Builds a structured, multi-section Executive Summary for any PDF document.
+ * Shared by both the PDF Chat Summarizer and the 1-tap "Summarize PDF" card inside the PDF Reader.
+ */
+internal fun buildStructuredExecutiveSummary(
+    fileName: String,
+    extraction: DocumentExtractionResult,
+    provenanceSummary: String? = null
+): String {
+    val pages = extraction.pages
+    val totalPages = pages.size.coerceAtLeast(1)
+    val ocrPageCount = pages.count {
+        it.source == ExtractionSource.ML_KIT_OCR || it.source == ExtractionSource.FUSED_HYBRID_OCR
+    }
+    val digitalPageCount = pages.count { it.source == ExtractionSource.PDF_TEXT }
+    val resolvedProvenance = provenanceSummary ?: when {
+        ocrPageCount > 0 && digitalPageCount > 0 ->
+            "$totalPages pages ($digitalPageCount digital text + $ocrPageCount Visual/Fused OCR)"
+        ocrPageCount > 0 ->
+            "$totalPages ${if (totalPages == 1) "page" else "pages"} (Visual OCR via ML Kit)"
+        else ->
+            "$totalPages ${if (totalPages == 1) "page" else "pages"} (Digital Text via PDFBox)"
+    }
+
+    val fullDocumentText = pages.joinToString("\n\n") { it.normalizedText }
+    val posSummary = OnDevicePosTagger.analyzeText(fullDocumentText)
+    val readingTimeMin = (posSummary.totalWords / 200.0).coerceAtLeast(0.5)
+    val readingTimeLabel = if (readingTimeMin < 1.0) "< 1 min read" else "${readingTimeMin.toInt()} min read"
+
+    val docCategory = classifyDocumentCategory(fileName, extraction)
+    val topTopics = extractTopDocumentKeyphrases(extraction, limit = 7)
+    val salientSentences = extractSalientSummarySentences(extraction, maxSentences = 5)
+    val keyValuePairs = extractStructuredKeyValuePairs(extraction, maxPairs = 6)
+    val keyMetrics = extractQuantitativeFacts(extraction, maxFacts = 6)
+    val actionItems = extractActionItemsAndAnomalies(extraction, maxItems = 5)
+    val allSections = pages.flatMap { it.detectedSections }.distinct().take(8)
+
+    val thesisLine = salientSentences.firstOrNull()?.second
+        ?: pages.firstOrNull()?.let { summarizeSinglePage(it) }
+        ?: "Structured document containing ${posSummary.totalWords} words across $totalPages pages."
+
+    return buildString {
+        append("Executive Summary — $fileName\n")
+        append("• Document Type: $docCategory\n")
+        append("• Core Purpose: $thesisLine\n")
+        append("• Scope & Provenance: $resolvedProvenance • ${posSummary.totalWords} words ($readingTimeLabel) • ${extraction.chunks.size} indexed chunks")
+        if (extraction.removedRunningHeadersCount > 0) {
+            append(" (${extraction.removedRunningHeadersCount} repeated headers/footers stripped)")
+        }
+        append('\n')
+        if (allSections.isNotEmpty()) {
+            append("• Detected Sections: ${allSections.joinToString(" • ")}\n")
+        }
+        if (topTopics.isNotEmpty()) {
+            append("• Key Concepts & Entities: ${topTopics.joinToString(", ")}\n")
+        }
+
+        if (keyValuePairs.isNotEmpty()) {
+            append("\n1. Structured Fields & Identifiers:\n")
+            keyValuePairs.forEach { (pageNum, kv) ->
+                append("• [Page $pageNum] $kv\n")
+            }
+        }
+
+        if (salientSentences.isNotEmpty()) {
+            append("\n2. Key Highlights & Main Findings:\n")
+            salientSentences.forEach { (pageNum, sentence) ->
+                append("• [Page $pageNum] $sentence\n")
+            }
+        }
+
+        if (keyMetrics.isNotEmpty()) {
+            append("\n3. Notable Numbers, Dates, Tables & Measurements:\n")
+            keyMetrics.forEach { (pageNum, fact) ->
+                append("• [Page $pageNum] $fact\n")
+            }
+        }
+
+        if (actionItems.isNotEmpty()) {
+            append("\n4. Action Items, Recommendations & Flagged Alerts:\n")
+            actionItems.forEach { (pageNum, item) ->
+                append("• [Page $pageNum] $item\n")
+            }
+        }
+
+        append("\n5. Page-by-Page Breakdown:\n")
+        pages.take(10).forEach { page ->
+            val heading = extractPageHeadingOrTitle(page)
+            val pageDigest = summarizeSinglePage(page)
+            val badge = when (page.source) {
+                ExtractionSource.ML_KIT_OCR -> " [Visual OCR]"
+                ExtractionSource.FUSED_HYBRID_OCR -> " [Hybrid Fused]"
+                else -> ""
+            }
+            if (!pageDigest.equals(heading, ignoreCase = true) && !pageDigest.startsWith(heading, ignoreCase = true)) {
+                append("• Page ${page.pageNumber}$badge ($heading): $pageDigest\n")
+            } else {
+                append("• Page ${page.pageNumber}$badge: $pageDigest\n")
+            }
+        }
+
+        if (posSummary.totalWords >= 10) {
+            val probPct = String.format(Locale.US, "%.1f%%", posSummary.probabilityOfFiction * 100.0)
+            val radjpronStr = String.format(Locale.US, "%.3f", posSummary.rAdjPron)
+            val radvadjStr = String.format(Locale.US, "%.3f", posSummary.rAdvAdj)
+            append("\n6. Linguistic & Genre Profile:\n")
+            append("• Classification: ${posSummary.predictedGenreLabel} (Probability of Fiction = $probPct, RADJPRON = $radjpronStr, RADVADJ = $radvadjStr)\n")
+            append("• POS Breakdown: ${posSummary.nounCount} Nouns • ${posSummary.verbCount} Verbs • ${posSummary.adjectiveCount} Adjectives • ${posSummary.adverbCount} Adverbs • ${posSummary.pronounCount} Pronouns")
+        }
+    }.trim()
+}
+
+/**
+ * Automatically classifies the PDF document domain based on filename, section headers, and lexical cues.
+ */
+internal fun classifyDocumentCategory(
+    fileName: String,
+    extraction: DocumentExtractionResult
+): String {
+    val sampleText = (fileName + "\n" + extraction.pages.take(3).joinToString("\n") { it.normalizedText })
+        .lowercase(Locale.ROOT)
+
+    return when {
+        listOf("hemoglobin", "hematology", "pathology", "patient", "specimen", "mg/dl", "reference interval", "diagnostic", "clinical", "cholesterol", "glucose").count { sampleText.contains(it) } >= 2 ->
+            "Medical / Clinical Lab Report"
+        listOf("invoice", "subtotal", "amount due", "billing", "receipt", "tax", "payment", "remittance", "total due", "balance").count { sampleText.contains(it) } >= 2 ->
+            "Financial Invoice / Billing Statement"
+        listOf("abstract", "methodology", "algorithm", "experiment", "references", "theorem", "evaluation", "architecture", "dataset", "neural").count { sampleText.contains(it) } >= 2 ->
+            "Technical / Academic Paper & Specification"
+        listOf("agreement", "contract", "clause", "liability", "indemnity", "hereby", "jurisdiction", "warranty", "terms and conditions").count { sampleText.contains(it) } >= 2 ->
+            "Legal Agreement / Policy Document"
+        listOf("curriculum vitae", "resume", "experience", "education", "skills", "certifications", "employment").count { sampleText.contains(it) } >= 3 ->
+            "Resume / Curriculum Vitae"
+        listOf("itinerary", "boarding", "flight", "reservation", "check-in", "passenger", "booking").count { sampleText.contains(it) } >= 2 ->
+            "Travel / Booking Itinerary"
+        else ->
+            "General Document / Reference Report"
+    }
+}
+
+/**
+ * Extracts structured `Key: Value` or `Column 1 → Column 2` fields (e.g., Patient Name, Invoice #,
+ * Account ID, Date, Status, Total Amount) across all pages.
+ */
+internal fun extractStructuredKeyValuePairs(
+    extraction: DocumentExtractionResult,
+    maxPairs: Int
+): List<Pair<Int, String>> {
+    val pairs = mutableListOf<Pair<Int, String>>()
+    val seenKeys = mutableSetOf<String>()
+
+    for (page in extraction.pages) {
+        for (rawLine in page.normalizedText.lines()) {
+            val line = rawLine.trim().trimStart('•', '-', '*').trim()
+            if (line.length !in 6..140 || isBoilerplateMetadataLine(line)) continue
+
+            // Case 1: Explicit "Key: Value" line
+            val colonIdx = line.indexOf(':')
+            if (colonIdx in 2..42) {
+                val key = line.substring(0, colonIdx).trim()
+                val value = line.substring(colonIdx + 1).trim()
+                val keyWords = key.split(Regex("\\s+")).size
+                if (keyWords in 1..5 && value.length in 1..85 && key.any { it.isLetter() }) {
+                    val normKey = key.lowercase(Locale.ROOT)
+                    if (seenKeys.add(normKey)) {
+                        pairs.add(page.pageNumber to "$key → $value")
+                        if (pairs.size >= maxPairs) return pairs
+                    }
+                }
+            } else if (line.contains(" | ")) {
+                // Case 2: Reconstructed spatial table row ("Parameter | Value | Unit/Range")
+                val cells = line.split(" | ").map { it.trim() }.filter { it.isNotEmpty() }
+                if (cells.size in 2..5 && cells[0].length in 2..42 && cells.drop(1).any { it.any { ch -> ch.isDigit() } }) {
+                    val normKey = cells[0].lowercase(Locale.ROOT)
+                    if (seenKeys.add(normKey)) {
+                        val formatted = "${cells[0]} → ${cells.drop(1).joinToString(" | ")}"
+                        pairs.add(page.pageNumber to formatted)
+                        if (pairs.size >= maxPairs) return pairs
+                    }
+                }
+            }
+        }
+    }
+    return pairs
+}
+
+/**
+ * Extracts actionable items, recommendations, deadlines, conclusions, and flagged anomalies
+ * (e.g., out-of-range lab values, overdue balances, required follow-ups, or key conclusions).
+ */
+internal fun extractActionItemsAndAnomalies(
+    extraction: DocumentExtractionResult,
+    maxItems: Int
+): List<Pair<Int, String>> {
+    val results = mutableListOf<Pair<Int, String>>()
+    val seen = mutableSetOf<String>()
+    val actionOrAlertRegex = Regex(
+        "\\b(recommend\\w*|action\\w*|follow[- ]?up|advise\\w*|must|required|deadline|due\\s+date|due\\s+by|urgent|warning|note:|important|conclusion\\w*|borderline|elevated|high|low|abnormal|deficit|insufficient|exceed\\w*|re-check|consult|schedule|pay\\s+by)\\b",
+        RegexOption.IGNORE_CASE
+    )
+
+    for (page in extraction.pages) {
+        val sentences = TextChunker.splitIntoSentences(page.normalizedText)
+            .flatMap { block ->
+                if (block.contains('\n')) block.lines().map { it.trim() } else listOf(block.trim())
+            }
+            .map { it.trimStart('•', '-', '*').trim() }
+            .filter { it.length in 16..260 && !isBoilerplateMetadataLine(it) }
+
+        for (sentence in sentences) {
+            if (actionOrAlertRegex.containsMatchIn(sentence)) {
+                val key = sentence.lowercase(Locale.ROOT).take(60)
+                if (seen.add(key)) {
+                    results.add(page.pageNumber to sentence)
+                    if (results.size >= maxItems) return results
+                }
+            }
+        }
+    }
+    return results
 }
 
 /**
@@ -1367,11 +1601,12 @@ fun FullScreenPdfChatDialog(
     val hybridExtractor = remember(context) { HybridPdfExtractor(context.applicationContext) }
 
     var selectedEngine by remember(file.id) { mutableStateOf(PdfChatEngineOption.LOCAL_GEMMA_E2B) }
+    var forceVisualOcrMode by remember(file.id) { mutableStateOf(false) }
     var extractionResult by remember(file.id) { mutableStateOf<DocumentExtractionResult?>(null) }
     var extractedPages by remember(file.id) { mutableStateOf<List<String>>(emptyList()) }
     var isIndexingPdf by remember(file.id) { mutableStateOf(true) }
     var indexingProgressLabel by remember(file.id) {
-        mutableStateOf("Running Hybrid PDF Extractor (PDFBox + ML Kit OCR)…")
+        mutableStateOf("Running Hybrid PDF Extractor (PDFBox + ML Kit Visual OCR)…")
     }
     var isGeneratingReply by remember(file.id) { mutableStateOf(false) }
     var questionInput by remember(file.id) { mutableStateOf("") }
@@ -1383,14 +1618,23 @@ fun FullScreenPdfChatDialog(
         }
     }
 
-    LaunchedEffect(file.id) {
+    LaunchedEffect(file.id, forceVisualOcrMode) {
         isIndexingPdf = true
+        val config = ExtractionConfig(
+            enableOcrFallback = true,
+            forceOcrAllPages = forceVisualOcrMode,
+            smartVisualOcrFusion = true
+        )
         val result = withContext(Dispatchers.IO) {
             hybridExtractor.extractForPhoneFile(
                 file = file,
+                config = config,
                 onPageProgress = { current, total ->
-                    indexingProgressLabel =
-                        "Extracting Page $current of $total (PDFBox Digital + ML Kit OCR)…"
+                    indexingProgressLabel = if (forceVisualOcrMode) {
+                        "Visual OCR Mode: Scanning Page $current of $total via ML Kit Vision…"
+                    } else {
+                        "Extracting Page $current of $total (Smart Hybrid PDFBox + Visual OCR)…"
+                    }
                 }
             )
         }
@@ -1398,32 +1642,36 @@ fun FullScreenPdfChatDialog(
         val pages = result.pages.map { it.normalizedText }
         extractedPages = pages
 
-        val ocrCount = result.pages.count { it.source == ExtractionSource.ML_KIT_OCR }
+        val ocrCount = result.pages.count {
+            it.source == ExtractionSource.ML_KIT_OCR || it.source == ExtractionSource.FUSED_HYBRID_OCR
+        }
         val digitalCount = result.pages.count { it.source == ExtractionSource.PDF_TEXT }
         val sourceSummary = when {
+            forceVisualOcrMode ->
+                "${pages.size} pages via Full Visual ML Kit OCR (Image OCR pipeline)"
             ocrCount > 0 && digitalCount > 0 ->
-                "$digitalCount digital text pages + $ocrCount ML Kit OCR pages"
+                "$digitalCount digital text pages + $ocrCount Visual/Fused OCR pages"
             ocrCount > 0 ->
-                "$ocrCount pages via on-device ML Kit OCR"
+                "$ocrCount pages via on-device ML Kit Visual OCR"
             else ->
                 "${pages.size} pages via PDFBox digital text layer"
         }
 
         val welcomeMsg = PdfChatMessage(
-            id = "welcome_${file.id}",
+            id = "welcome_${file.id}_${forceVisualOcrMode}",
             isUser = false,
             engine = PdfChatEngineOption.LOCAL_GEMMA_E2B,
-            text = "Hybrid PDF Extraction complete for ${file.name}: extracted $sourceSummary into ${result.chunks.size} sentence-aware chunks. " +
-                "Ask a question in the box above or tap a quick prompt below.",
+            text = "Hybrid PDF Extraction complete for ${file.name} (${classifyDocumentCategory(file.name, result)}): extracted $sourceSummary into ${result.chunks.size} sentence-aware chunks. " +
+                "Tap \"Summarize this PDF\" below for a structured 6-part executive summary or ask any question.",
             pageCitations = result.pages.take(6).map { page ->
-                if (page.source == ExtractionSource.ML_KIT_OCR) {
-                    "Page ${page.pageNumber} (OCR)"
-                } else {
-                    "Page ${page.pageNumber}"
+                when (page.source) {
+                    ExtractionSource.ML_KIT_OCR -> "Page ${page.pageNumber} (Visual OCR)"
+                    ExtractionSource.FUSED_HYBRID_OCR -> "Page ${page.pageNumber} (Hybrid Fused)"
+                    else -> "Page ${page.pageNumber}"
                 }
             }
         )
-        if (messages.isEmpty()) {
+        if (messages.isEmpty() || messages.size == 1 && messages.first().id.startsWith("welcome_")) {
             messages = listOf(welcomeMsg)
         }
         isIndexingPdf = false
@@ -1447,7 +1695,7 @@ fun FullScreenPdfChatDialog(
                 isUser = false,
                 engine = activeEngine,
                 text = if (activeEngine == PdfChatEngineOption.LOCAL_GEMMA_E2B) {
-                    "Running Local Gemma E2B RAG over sentence-aware PDF chunks…"
+                    "Running Local Gemma E2B RAG & Structured Synthesizer over PDF chunks…"
                 } else {
                     "Connecting to Gemini 3.8 Flash (Keyless Free Tier) and analyzing PDF chunks…"
                 },
@@ -1463,7 +1711,10 @@ fun FullScreenPdfChatDialog(
                 runCatching { listState.animateScrollToItem(targetIndex) }
 
                 val currentExtraction = extractionResult ?: withContext(Dispatchers.IO) {
-                    hybridExtractor.extractForPhoneFile(file)
+                    hybridExtractor.extractForPhoneFile(
+                        file = file,
+                        config = ExtractionConfig(forceOcrAllPages = forceVisualOcrMode)
+                    )
                 }.also {
                     extractionResult = it
                     extractedPages = it.pages.map { p -> p.normalizedText }
@@ -1595,6 +1846,22 @@ fun FullScreenPdfChatDialog(
                                     verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                                 ) {
+                                    TextButton(
+                                        onClick = { forceVisualOcrMode = !forceVisualOcrMode },
+                                        modifier = Modifier.testTag("pdf_chat_visual_ocr_toggle")
+                                    ) {
+                                        Text(
+                                            text = if (forceVisualOcrMode) "Visual OCR: ON" else "Visual OCR",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontWeight = FontWeight.Bold,
+                                            color = if (forceVisualOcrMode) {
+                                                MaterialTheme.colorScheme.tertiary
+                                            } else {
+                                                MaterialTheme.colorScheme.primary
+                                            }
+                                        )
+                                    }
+
                                     TextButton(
                                         onClick = { onOpenPdfReader(file) },
                                         modifier = Modifier.testTag("pdf_chat_open_reader_button")
@@ -1839,6 +2106,7 @@ fun FullScreenPdfChatDialog(
                                         ) {
                                             val quickPrompts = listOf(
                                                 "Summarize this PDF",
+                                                "Action items & anomalies",
                                                 "Key numbers, dates & totals",
                                                 "Main findings & values",
                                                 "List all pages & sections"

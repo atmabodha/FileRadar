@@ -1,6 +1,7 @@
 package com.example
 
 import android.content.Context
+import android.net.Uri
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
@@ -11,6 +12,8 @@ import com.example.model.FileCategory
 import com.example.model.FileFormatters
 import com.example.model.PhoneFileItem
 import com.example.model.StorageLocation
+import com.example.pdfextractor.HybridPdfExtractor
+import com.example.pdfextractor.model.ExtractionSource
 import com.example.ui.components.PdfChatEngineOption
 import com.example.ui.components.PlaceholderGeminiSubscriptionRepository
 import com.example.ui.components.cleanAndSanitizePdfPageText
@@ -444,6 +447,135 @@ class ExampleRobolectricTest {
         )
         assertTrue(fictionBreakdown.isFictionPredicted)
         assertEquals("Fiction", fictionBreakdown.predictedGenreLabel)
+    }
+
+    @Test
+    fun `AI Search screen displays Sync button and surfaces recent phone images ahead of sample PDFs`() {
+        composeTestRule.onNodeWithTag("nav_tab_ai_search")
+            .assertIsDisplayed()
+            .performClick()
+
+        composeTestRule.onNodeWithTag("ai_rescan_button")
+            .assertIsDisplayed()
+            .performClick()
+
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val engine = OnDeviceAiEngine(context)
+        val now = System.currentTimeMillis()
+
+        // Create 25 sample PDFs followed by 2 real recent phone images
+        val samplePdfs = (1..25).map { idx ->
+            PhoneFileItem(
+                id = "sample_pdf_$idx",
+                name = "Sample_Document_$idx.pdf",
+                extension = "pdf",
+                fullPath = "/storage/emulated/0/Download/Sample_Document_$idx.pdf",
+                sizeBytes = 500_000L,
+                createdAtMillis = now - idx * 3_600_000L,
+                modifiedAtMillis = now - idx * 3_600_000L,
+                storageLocation = StorageLocation.INTERNAL,
+                volumeLabel = "Internal Shared Storage",
+                category = FileCategory.PDF,
+                mimeType = "application/pdf",
+                isSampleFile = true
+            )
+        }
+        val recentPhoneImage = PhoneFileItem(
+            id = "/storage/emulated/0/DCIM/Camera/IMG_20261122_093000.jpg",
+            name = "IMG_20261122_093000.jpg",
+            extension = "jpg",
+            fullPath = "/storage/emulated/0/DCIM/Camera/IMG_20261122_093000.jpg",
+            sizeBytes = 3_400_000L,
+            createdAtMillis = now - 60_000L,
+            modifiedAtMillis = now - 60_000L,
+            storageLocation = StorageLocation.INTERNAL,
+            volumeLabel = "Internal Shared Storage",
+            category = FileCategory.IMAGE,
+            mimeType = "image/jpeg",
+            isSampleFile = false
+        )
+
+        val combinedFiles = samplePdfs + recentPhoneImage
+
+        // Empty query on AI Search must NOT truncate out recentPhoneImage and must place real phone image first
+        val emptyQueryResults = engine.performSemanticSearch(query = "", files = combinedFiles)
+        assertTrue(emptyQueryResults.size > 15)
+        assertEquals(recentPhoneImage.id, emptyQueryResults.first().file.id)
+
+        // Querying "recent phone images & photos" must rank the real recent phone camera image at #1
+        val imageQueryResults = engine.performSemanticSearch(
+            query = "recent phone images & photos",
+            files = combinedFiles
+        )
+        assertTrue(imageQueryResults.isNotEmpty())
+        assertEquals(recentPhoneImage.id, imageQueryResults.first().file.id)
+    }
+
+    @Test
+    fun `Upgraded PDF parser preserves table rows and lab units and generates 6-part structured summary`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val extractor = HybridPdfExtractor(context)
+
+        // 1. Verify cleanAndSanitizePdfPageText preserves pipe-delimited table rows, single-digit cells, lab units, and invoice IDs
+        val rawTableAndUnitsText = """
+            1. CLINICAL HEMATOLOGY & BIOCHEMISTRY PANEL
+            Patient Name: Arjun Mehta
+            Report ID: INV-2026-04B
+            Test | Result | Unit | Flag
+            Hemoglobin | 14.8 | g/dL | Normal
+            eGFR | 92 | mL/min/1.73m2 | Normal
+            WBC Count | 7.4 | x10^3/uL | 1
+             Fasting Glucose | 112 | mg/dL | Elevated
+            Recommendation: Schedule a follow-up fasting lipid and glycemic check within 30 days.
+        """.trimIndent()
+
+        val cleaned = com.example.ui.components.cleanAndSanitizePdfPageText(rawTableAndUnitsText)
+        assertTrue(cleaned.contains("INV-2026-04B"))
+        assertTrue(cleaned.contains("mL/min/1.73m2"))
+        assertTrue(cleaned.contains("x10^3/uL"))
+        assertTrue(cleaned.contains("Hemoglobin | 14.8 | g/dL | Normal"))
+        assertTrue(cleaned.contains("WBC Count | 7.4 | x10^3/uL | 1"))
+
+        // 2. Verify Smart Visual OCR Fusion merges unique visual OCR lines with digital text
+        val (fusedText, fusedSource) = extractor.selectOrFuseDigitalAndVisualOcrText(
+            cleanedDigital = "Header Stamp: Confidential Medical Record 2026",
+            cleanedVisualOcr = cleaned,
+            forceVisualOcr = false
+        )
+        assertEquals(ExtractionSource.FUSED_HYBRID_OCR, fusedSource)
+        assertTrue(fusedText.contains("Hemoglobin | 14.8 | g/dL | Normal"))
+        assertTrue(fusedText.contains("Confidential Medical Record 2026"))
+
+        // 3. Verify 6-part Structured Executive Summary includes Document Type, Structured Key-Value Fields,
+        // Action Items/Anomalies, Page-by-Page Breakdown, and Linguistic & Genre Profile
+        val uri = Uri.parse("file:///storage/emulated/0/Download/Lab_Report_2026.pdf")
+        val extractedPage = com.example.pdfextractor.model.ExtractedPage(
+            pageNumber = 1,
+            rawText = fusedText,
+            normalizedText = com.example.pdfextractor.TextNormalizer.normalize(fusedText),
+            source = fusedSource,
+            detectedSections = listOf("1. CLINICAL HEMATOLOGY & BIOCHEMISTRY PANEL")
+        )
+        val chunks = com.example.pdfextractor.TextChunker.chunkPages(uri, listOf(extractedPage))
+        val extractionResult = com.example.pdfextractor.model.DocumentExtractionResult(
+            documentUri = uri,
+            totalPages = 1,
+            pages = listOf(extractedPage),
+            chunks = chunks,
+            removedRunningHeadersCount = 0
+        )
+
+        val summary = com.example.ui.components.buildStructuredExecutiveSummary(
+            fileName = "Lab_Report_2026.pdf",
+            extraction = extractionResult
+        )
+        assertTrue(summary.contains("Document Type: Medical / Clinical Lab Report"))
+        assertTrue(summary.contains("1. Structured Fields & Identifiers:"))
+        assertTrue(summary.contains("Patient Name → Arjun Mehta"))
+        assertTrue(summary.contains("4. Action Items, Recommendations & Flagged Alerts:"))
+        assertTrue(summary.contains("follow-up"))
+        assertTrue(summary.contains("6. Linguistic & Genre Profile:"))
+        assertTrue(summary.contains("Probability of Fiction"))
     }
 }
 
