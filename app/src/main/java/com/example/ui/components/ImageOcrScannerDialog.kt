@@ -1170,17 +1170,17 @@ fun FullScreenImageOcrScannerDialog(
                         .fillMaxSize()
                         .widthIn(max = 760.dp)
                 ) {
-                    // Compact Top Header Bar
+                    // Clean Top App Bar
                     Surface(
                         color = MaterialTheme.colorScheme.surface,
-                        tonalElevation = 3.dp,
+                        tonalElevation = 2.dp,
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Column(modifier = Modifier.fillMaxWidth()) {
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                                    .padding(horizontal = 16.dp, vertical = 10.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.SpaceBetween
                             ) {
@@ -1192,35 +1192,26 @@ fun FullScreenImageOcrScannerDialog(
                                     Surface(
                                         shape = CircleShape,
                                         color = MaterialTheme.colorScheme.primaryContainer,
-                                        modifier = Modifier.size(38.dp)
+                                        modifier = Modifier.size(36.dp)
                                     ) {
                                         Box(contentAlignment = Alignment.Center) {
                                             Icon(
                                                 imageVector = Icons.Default.DocumentScanner,
                                                 contentDescription = null,
                                                 tint = MaterialTheme.colorScheme.primary,
-                                                modifier = Modifier.size(20.dp)
+                                                modifier = Modifier.size(18.dp)
                                             )
                                         }
                                     }
 
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(
-                                            text = stringResource(R.string.image_ocr_scanner_title),
-                                            style = MaterialTheme.typography.titleMedium,
-                                            fontWeight = FontWeight.Bold,
-                                            color = MaterialTheme.colorScheme.onSurface,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
-                                        Text(
-                                            text = "On-Device Google ML Kit OCR • Spatial Table & Line Order",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.primary,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
-                                    }
+                                    Text(
+                                        text = stringResource(R.string.image_ocr_scanner_title),
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
                                 }
 
                                 IconButton(
@@ -1234,11 +1225,21 @@ fun FullScreenImageOcrScannerDialog(
                                 }
                             }
 
-                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
                         }
                     }
 
-                    // Vertically Scrollable Body
+                    var selectedPosFilter by remember {
+                        mutableStateOf<MajorPosCategory?>(null)
+                    }
+                    var showExpandedImagePreview by remember {
+                        mutableStateOf(false)
+                    }
+                    val posBreakdown = remember(editableExtractedText) {
+                        OnDevicePosTagger.analyzeText(editableExtractedText)
+                    }
+
+                    // Vertically Scrollable Body with Clean Top-Level Cards
                     LazyColumn(
                         modifier = Modifier
                             .weight(1f)
@@ -1247,11 +1248,11 @@ fun FullScreenImageOcrScannerDialog(
                             start = 16.dp,
                             end = 16.dp,
                             top = 14.dp,
-                            bottom = 48.dp
+                            bottom = 40.dp
                         ),
                         verticalArrangement = Arrangement.spacedBy(14.dp)
                     ) {
-                        // 1. Primary Action Card: Take Picture OR Upload Image + High-Contrast Filter
+                        // 1. Compact Capture & Source Bar Card
                         item(key = "ocr_capture_controls") {
                             Card(
                                 modifier = Modifier.fillMaxWidth(),
@@ -1259,20 +1260,14 @@ fun FullScreenImageOcrScannerDialog(
                                 colors = CardDefaults.cardColors(
                                     containerColor = MaterialTheme.colorScheme.surface
                                 ),
-                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f))
                             ) {
                                 Column(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .padding(14.dp),
-                                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                                    verticalArrangement = Arrangement.spacedBy(10.dp)
                                 ) {
-                                    Text(
-                                        text = stringResource(R.string.image_ocr_scanner_subtitle),
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-
                                     Row(
                                         modifier = Modifier.fillMaxWidth(),
                                         horizontalArrangement = Arrangement.spacedBy(10.dp)
@@ -1316,7 +1311,7 @@ fun FullScreenImageOcrScannerDialog(
                                         }
                                     }
 
-                                    // Options Row: High-Contrast Filter Toggle + Sample Document Test Button
+                                    // Compact Options Row
                                     Row(
                                         modifier = Modifier.fillMaxWidth(),
                                         verticalAlignment = Alignment.CenterVertically,
@@ -1337,7 +1332,7 @@ fun FullScreenImageOcrScannerDialog(
                                             },
                                             label = {
                                                 Text(
-                                                    text = "High-Contrast Scan Filter",
+                                                    text = "High-Contrast",
                                                     style = MaterialTheme.typography.labelSmall
                                                 )
                                             },
@@ -1349,7 +1344,7 @@ fun FullScreenImageOcrScannerDialog(
                                                         Icons.Default.AutoFixHigh
                                                     },
                                                     contentDescription = null,
-                                                    modifier = Modifier.size(16.dp)
+                                                    modifier = Modifier.size(15.dp)
                                                 )
                                             },
                                             modifier = Modifier.testTag("ocr_high_contrast_toggle")
@@ -1360,13 +1355,13 @@ fun FullScreenImageOcrScannerDialog(
                                                 val sampleBmp = ImageOcrExtractor.createSampleTextDocumentBitmap()
                                                 runOcrOnBitmap(
                                                     sampleBmp,
-                                                    "Sample Snapshot Receipt",
+                                                    "Sample Receipt",
                                                     highContrastEnabled
                                                 )
                                             },
                                             label = {
                                                 Text(
-                                                    text = "Try Sample Receipt",
+                                                    text = "Sample Receipt",
                                                     style = MaterialTheme.typography.labelSmall
                                                 )
                                             },
@@ -1374,11 +1369,85 @@ fun FullScreenImageOcrScannerDialog(
                                                 Icon(
                                                     imageVector = Icons.Default.Refresh,
                                                     contentDescription = null,
-                                                    modifier = Modifier.size(16.dp)
+                                                    modifier = Modifier.size(15.dp)
                                                 )
                                             },
                                             modifier = Modifier.testTag("ocr_try_sample_image_button")
                                         )
+                                    }
+
+                                    // Integrated Compact Source Image Strip when an image is loaded
+                                    val currentPreview = previewBitmap
+                                    if (currentPreview != null) {
+                                        HorizontalDivider(
+                                            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+                                        )
+
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .clip(MaterialTheme.shapes.small)
+                                                .clickable {
+                                                    showExpandedImagePreview = !showExpandedImagePreview
+                                                }
+                                                .padding(vertical = 2.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                        ) {
+                                            Image(
+                                                bitmap = currentPreview.asImageBitmap(),
+                                                contentDescription = "Captured or uploaded image for OCR",
+                                                contentScale = ContentScale.Crop,
+                                                modifier = Modifier
+                                                    .size(48.dp)
+                                                    .clip(MaterialTheme.shapes.extraSmall)
+                                                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                                                    .testTag("ocr_source_image_preview")
+                                            )
+
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = activeSourceLabel,
+                                                    style = MaterialTheme.typography.labelMedium,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    color = MaterialTheme.colorScheme.onSurface,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                                ocrResult?.let { res ->
+                                                    Text(
+                                                        text = "${res.lineCount} lines • ${res.wordCount} words • ${res.charCount} chars",
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                    )
+                                                }
+                                            }
+
+                                            Text(
+                                                text = if (showExpandedImagePreview) "Hide Image" else "View Image",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = MaterialTheme.colorScheme.primary
+                                            )
+                                        }
+
+                                        if (showExpandedImagePreview) {
+                                            Box(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .heightIn(min = 120.dp, max = 220.dp)
+                                                    .clip(MaterialTheme.shapes.small)
+                                                    .background(MaterialTheme.colorScheme.surfaceVariant),
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                Image(
+                                                    bitmap = currentPreview.asImageBitmap(),
+                                                    contentDescription = "Expanded source image preview",
+                                                    contentScale = ContentScale.Fit,
+                                                    modifier = Modifier.fillMaxWidth()
+                                                )
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1389,106 +1458,36 @@ fun FullScreenImageOcrScannerDialog(
                             item(key = "ocr_loading") {
                                 Surface(
                                     shape = MaterialTheme.shapes.medium,
-                                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f),
-                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.4f)),
+                                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.3f),
+                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.35f)),
                                     modifier = Modifier.fillMaxWidth()
                                 ) {
                                     Row(
                                         modifier = Modifier
                                             .fillMaxWidth()
-                                            .padding(16.dp),
+                                            .padding(14.dp),
                                         verticalAlignment = Alignment.CenterVertically,
                                         horizontalArrangement = Arrangement.spacedBy(12.dp)
                                     ) {
                                         CircularProgressIndicator(
-                                            modifier = Modifier.size(22.dp),
+                                            modifier = Modifier.size(20.dp),
                                             strokeWidth = 2.5.dp,
                                             color = MaterialTheme.colorScheme.primary
                                         )
-                                        Column {
-                                            Text(
-                                                text = "Extracting text from $activeSourceLabel…",
-                                                style = MaterialTheme.typography.titleSmall,
-                                                fontWeight = FontWeight.SemiBold,
-                                                color = MaterialTheme.colorScheme.onSurface
-                                            )
-                                            Text(
-                                                text = "Running Google ML Kit Text Recognition + spatial row clustering on-device",
-                                                style = MaterialTheme.typography.bodySmall,
-                                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                                            )
-                                        }
+                                        Text(
+                                            text = "Extracting text from $activeSourceLabel…",
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontWeight = FontWeight.Medium,
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
                                     }
                                 }
                             }
                         }
 
-                        // 3. Captured / Uploaded Image Preview + OCR Telemetry Badges
-                        val currentPreview = previewBitmap
-                        if (currentPreview != null) {
-                            item(key = "ocr_image_preview") {
-                                Card(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    shape = MaterialTheme.shapes.medium,
-                                    colors = CardDefaults.cardColors(
-                                        containerColor = MaterialTheme.colorScheme.surface
-                                    ),
-                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
-                                ) {
-                                    Column(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .padding(12.dp),
-                                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                                    ) {
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.SpaceBetween
-                                        ) {
-                                            Text(
-                                                text = "SOURCE: ${activeSourceLabel.uppercase()}",
-                                                style = MaterialTheme.typography.labelSmall,
-                                                fontWeight = FontWeight.Bold,
-                                                color = MaterialTheme.colorScheme.primary,
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis,
-                                                modifier = Modifier.weight(1f)
-                                            )
-                                            ocrResult?.let { res ->
-                                                Text(
-                                                    text = "${res.blockCount} blocks • ${res.lineCount} lines • ${res.wordCount} words",
-                                                    style = MaterialTheme.typography.labelSmall,
-                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                                )
-                                            }
-                                        }
-
-                                        Box(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .heightIn(min = 120.dp, max = 230.dp)
-                                                .clip(MaterialTheme.shapes.small)
-                                                .background(MaterialTheme.colorScheme.surfaceVariant),
-                                            contentAlignment = Alignment.Center
-                                        ) {
-                                            Image(
-                                                bitmap = currentPreview.asImageBitmap(),
-                                                contentDescription = "Captured or uploaded image for OCR",
-                                                contentScale = ContentScale.Fit,
-                                                modifier = Modifier
-                                                    .fillMaxWidth()
-                                                    .testTag("ocr_source_image_preview")
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // 4. Extracted Text Result Card (Editable + Copyable + Shareable)
                         val currentResult = ocrResult
                         if (currentResult != null) {
+                            // 3. Extracted Text Card (Clean editor + color highlight filter chips)
                             item(key = "ocr_extracted_text_result") {
                                 Card(
                                     modifier = Modifier.fillMaxWidth(),
@@ -1496,7 +1495,7 @@ fun FullScreenImageOcrScannerDialog(
                                     colors = CardDefaults.cardColors(
                                         containerColor = MaterialTheme.colorScheme.surface
                                     ),
-                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f))
+                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f))
                                 ) {
                                     Column(
                                         modifier = Modifier
@@ -1509,23 +1508,12 @@ fun FullScreenImageOcrScannerDialog(
                                             verticalAlignment = Alignment.CenterVertically,
                                             horizontalArrangement = Arrangement.SpaceBetween
                                         ) {
-                                            Column(modifier = Modifier.weight(1f)) {
-                                                Text(
-                                                    text = "EXTRACTED TEXT (${currentResult.charCount} chars)",
-                                                    style = MaterialTheme.typography.labelMedium,
-                                                    fontWeight = FontWeight.Bold,
-                                                    color = MaterialTheme.colorScheme.primary
-                                                )
-                                                Text(
-                                                    text = if (currentResult.highContrastApplied) {
-                                                        "Extracted with High-Contrast Pre-Filter • Editable below"
-                                                    } else {
-                                                        "Extracted via On-Device ML Kit OCR • Editable below"
-                                                    },
-                                                    style = MaterialTheme.typography.labelSmall,
-                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                                )
-                                            }
+                                            Text(
+                                                text = "Extracted Text",
+                                                style = MaterialTheme.typography.titleSmall,
+                                                fontWeight = FontWeight.Bold,
+                                                color = MaterialTheme.colorScheme.onSurface
+                                            )
 
                                             Row(
                                                 horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -1534,36 +1522,40 @@ fun FullScreenImageOcrScannerDialog(
                                                 FilledTonalButton(
                                                     onClick = copyExtractedText,
                                                     enabled = editableExtractedText.isNotBlank(),
-                                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-                                                    modifier = Modifier.testTag("ocr_copy_text_button")
+                                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                                    modifier = Modifier
+                                                        .height(34.dp)
+                                                        .testTag("ocr_copy_text_button")
                                                 ) {
                                                     Icon(
                                                         imageVector = Icons.Default.ContentCopy,
                                                         contentDescription = null,
-                                                        modifier = Modifier.size(16.dp)
+                                                        modifier = Modifier.size(14.dp)
                                                     )
-                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                    Spacer(modifier = Modifier.width(5.dp))
                                                     Text(
                                                         text = stringResource(R.string.ocr_copy_extracted_text),
-                                                        style = MaterialTheme.typography.labelMedium
+                                                        style = MaterialTheme.typography.labelSmall
                                                     )
                                                 }
 
                                                 OutlinedButton(
                                                     onClick = shareExtractedText,
                                                     enabled = editableExtractedText.isNotBlank(),
-                                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-                                                    modifier = Modifier.testTag("ocr_share_text_button")
+                                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                                    modifier = Modifier
+                                                        .height(34.dp)
+                                                        .testTag("ocr_share_text_button")
                                                 ) {
                                                     Icon(
                                                         imageVector = Icons.Default.Share,
                                                         contentDescription = null,
-                                                        modifier = Modifier.size(16.dp)
+                                                        modifier = Modifier.size(14.dp)
                                                     )
-                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                    Spacer(modifier = Modifier.width(5.dp))
                                                     Text(
                                                         text = stringResource(R.string.ocr_share_extracted_text),
-                                                        style = MaterialTheme.typography.labelMedium
+                                                        style = MaterialTheme.typography.labelSmall
                                                     )
                                                 }
                                             }
@@ -1572,23 +1564,17 @@ fun FullScreenImageOcrScannerDialog(
                                         if (editableExtractedText.isBlank() && currentResult.wordCount == 0) {
                                             Surface(
                                                 shape = MaterialTheme.shapes.small,
-                                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
                                                 modifier = Modifier.fillMaxWidth()
                                             ) {
                                                 Text(
-                                                    text = "No readable text was detected in this image. Try enabling 'High-Contrast Scan Filter' above or taking a closer, well-lit photo.",
-                                                    style = MaterialTheme.typography.bodyMedium,
+                                                    text = "No readable text detected. Try enabling High-Contrast above or taking a clearer photo.",
+                                                    style = MaterialTheme.typography.bodySmall,
                                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                    modifier = Modifier.padding(14.dp)
+                                                    modifier = Modifier.padding(12.dp)
                                                 )
                                             }
                                         } else {
-                                            val posBreakdown = remember(editableExtractedText) {
-                                                OnDevicePosTagger.analyzeText(editableExtractedText)
-                                            }
-                                            var selectedPosFilter by remember {
-                                                mutableStateOf<MajorPosCategory?>(null)
-                                            }
                                             val posVisualTransformation = remember(
                                                 posBreakdown.wordSpans,
                                                 selectedPosFilter
@@ -1606,40 +1592,42 @@ fun FullScreenImageOcrScannerDialog(
                                                     visualTransformation = posVisualTransformation,
                                                     modifier = Modifier
                                                         .fillMaxWidth()
-                                                        .heightIn(min = 180.dp, max = 460.dp)
+                                                        .heightIn(min = 140.dp, max = 340.dp)
                                                         .testTag("ocr_extracted_text_field"),
                                                     textStyle = MaterialTheme.typography.bodyMedium.copy(
                                                         fontFamily = FontFamily.Monospace
-                                                    ),
-                                                    label = {
-                                                        Text("Extracted Text (color-highlighted by POS • tap to edit)")
-                                                    }
+                                                    )
                                                 )
                                             }
-
-                                            OcrWordAndPosBreakdownSection(
-                                                posBreakdown = posBreakdown,
-                                                selectedCategory = selectedPosFilter,
-                                                onSelectCategory = { clickedCategory ->
-                                                    selectedPosFilter = if (selectedPosFilter == clickedCategory) {
-                                                        null
-                                                    } else {
-                                                        clickedCategory
-                                                    }
-                                                },
-                                                modifier = Modifier.fillMaxWidth()
-                                            )
                                         }
                                     }
                                 }
                             }
+
+                            // 4. Separate Top-Level POS Breakdown & Bar Graph Card + Final Fiction Prediction Card
+                            if (editableExtractedText.isNotBlank() || currentResult.wordCount > 0) {
+                                item(key = "ocr_pos_and_prediction_section") {
+                                    OcrWordAndPosBreakdownSection(
+                                        posBreakdown = posBreakdown,
+                                        selectedCategory = selectedPosFilter,
+                                        onSelectCategory = { clickedCategory ->
+                                            selectedPosFilter = if (selectedPosFilter == clickedCategory) {
+                                                null
+                                            } else {
+                                                clickedCategory
+                                            }
+                                        },
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                }
+                            }
                         } else if (!isProcessingOcr) {
-                            // Empty prompt state before the user snaps a photo or uploads an image
+                            // Clean Empty State before user snaps or uploads an image
                             item(key = "ocr_empty_state") {
                                 Surface(
                                     shape = MaterialTheme.shapes.large,
                                     color = MaterialTheme.colorScheme.surface,
-                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)),
                                     modifier = Modifier.fillMaxWidth()
                                 ) {
                                     Column(
@@ -1647,33 +1635,33 @@ fun FullScreenImageOcrScannerDialog(
                                             .fillMaxWidth()
                                             .padding(24.dp),
                                         horizontalAlignment = Alignment.CenterHorizontally,
-                                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                                        verticalArrangement = Arrangement.spacedBy(8.dp)
                                     ) {
                                         Surface(
                                             shape = CircleShape,
                                             color = MaterialTheme.colorScheme.primaryContainer,
-                                            modifier = Modifier.size(56.dp)
+                                            modifier = Modifier.size(52.dp)
                                         ) {
                                             Box(contentAlignment = Alignment.Center) {
                                                 Icon(
                                                     imageVector = Icons.Default.DocumentScanner,
                                                     contentDescription = null,
                                                     tint = MaterialTheme.colorScheme.primary,
-                                                    modifier = Modifier.size(28.dp)
+                                                    modifier = Modifier.size(24.dp)
                                                 )
                                             }
                                         }
 
                                         Text(
-                                            text = "Snap a Photo or Upload Any Image",
-                                            style = MaterialTheme.typography.titleMedium,
+                                            text = "Snap a Photo or Upload an Image",
+                                            style = MaterialTheme.typography.titleSmall,
                                             fontWeight = FontWeight.Bold,
                                             color = MaterialTheme.colorScheme.onSurface,
                                             textAlign = TextAlign.Center
                                         )
 
                                         Text(
-                                            text = "Tap 'Take Picture' to photograph text written on paper, whiteboards, signs, books, or receipts, or tap 'Upload Image' to pick a screenshot or photo from your phone.",
+                                            text = "Extract text on-device, highlight parts of speech by color, and classify Fiction vs. Non-Fiction.",
                                             style = MaterialTheme.typography.bodySmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                                             textAlign = TextAlign.Center
@@ -1794,140 +1782,117 @@ private fun OcrWordAndPosBreakdownSection(
         )
     }
 
-    Surface(
-        shape = MaterialTheme.shapes.medium,
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-        modifier = modifier.testTag("ocr_pos_breakdown_section")
+    Column(
+        modifier = modifier.testTag("ocr_pos_breakdown_section"),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+        // Card A: Word Count & POS Bar Graph + Compact Tag List
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = MaterialTheme.shapes.medium,
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surface
+            ),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f))
         ) {
-            // 1. Header row: Section label + Total Words pill badge
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = "WORD COUNT & PART-OF-SPEECH (POS) TAGS",
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                    Text(
-                        text = "Bar graph & color-matched word highlighting above",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-
-                Surface(
-                    shape = MaterialTheme.shapes.small,
-                    color = MaterialTheme.colorScheme.primaryContainer,
-                    modifier = Modifier.testTag("ocr_total_word_count_badge")
-                ) {
-                    Text(
-                        text = "${posBreakdown.totalWords} ${if (posBreakdown.totalWords == 1) "Word" else "Words"}",
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onPrimaryContainer,
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
-                    )
-                }
-            }
-
-            // 2. Interactive POS Highlight Legend & Filter Chips (controls highlighting in the text box above)
-            Row(
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalAlignment = Alignment.CenterVertically
+                    .padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                PosLegendChip(
-                    label = "All Colors",
-                    swatchColor = MaterialTheme.colorScheme.primary,
-                    isSelected = selectedCategory == null,
-                    onClick = { onSelectCategory(null) },
-                    testTag = "ocr_pos_filter_all"
-                )
-                barItems.forEach { item ->
+                // Header Row: Title + Total Word Count Badge
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Part-of-Speech (POS) Breakdown",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = "Tap any bar or tag to filter word highlights",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+
+                    Surface(
+                        shape = MaterialTheme.shapes.small,
+                        color = MaterialTheme.colorScheme.primaryContainer,
+                        modifier = Modifier.testTag("ocr_total_word_count_badge")
+                    ) {
+                        Text(
+                            text = "${posBreakdown.totalWords} ${if (posBreakdown.totalWords == 1) "Word" else "Words"}",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                        )
+                    }
+                }
+
+                // Filter Chips Row
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     PosLegendChip(
-                        label = "${item.label} (${item.count})",
-                        swatchColor = item.barColor,
-                        isSelected = selectedCategory == item.category,
-                        onClick = { onSelectCategory(item.category) },
-                        testTag = "ocr_pos_filter_${item.shortTag.lowercase(Locale.ROOT)}"
+                        label = "All Colors",
+                        swatchColor = MaterialTheme.colorScheme.primary,
+                        isSelected = selectedCategory == null,
+                        onClick = { onSelectCategory(null) },
+                        testTag = "ocr_pos_filter_all"
                     )
+                    barItems.forEach { item ->
+                        PosLegendChip(
+                            label = item.label,
+                            swatchColor = item.barColor,
+                            isSelected = selectedCategory == item.category,
+                            onClick = { onSelectCategory(item.category) },
+                            testTag = "ocr_pos_filter_${item.shortTag.lowercase(Locale.ROOT)}"
+                        )
+                    }
+                }
+
+                // Clean 5-Column Vertical Bar Graph (no duplicate horizontal chart)
+                OcrPosBarGraphCard(
+                    barItems = barItems,
+                    selectedCategory = selectedCategory,
+                    onSelectCategory = onSelectCategory
+                )
+
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f))
+
+                // Compact 5-Row POS Breakdown List (Color dot + Label + Sample Words + Count)
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    barItems.forEach { item ->
+                        PosCompactRowItem(
+                            item = item,
+                            totalWords = posBreakdown.totalWords,
+                            isSelected = selectedCategory == item.category,
+                            onClick = { onSelectCategory(item.category) }
+                        )
+                    }
                 }
             }
-
-            // 3. POS Tag Numbers Bar Graph (Vertical Column Chart + Horizontal Color Bars)
-            OcrPosBarGraphCard(
-                barItems = barItems,
-                totalWords = posBreakdown.totalWords,
-                selectedCategory = selectedCategory,
-                onSelectCategory = onSelectCategory
-            )
-
-            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
-
-            // 4. 5 Major POS Tag Cards in a 2-column + 3-column grid with matching color accents
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                PosStatPillCard(
-                    item = barItems[0],
-                    isSelected = selectedCategory == barItems[0].category,
-                    onClick = { onSelectCategory(barItems[0].category) },
-                    modifier = Modifier.weight(1f)
-                )
-                PosStatPillCard(
-                    item = barItems[1],
-                    isSelected = selectedCategory == barItems[1].category,
-                    onClick = { onSelectCategory(barItems[1].category) },
-                    modifier = Modifier.weight(1f)
-                )
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                PosStatPillCard(
-                    item = barItems[2],
-                    isSelected = selectedCategory == barItems[2].category,
-                    onClick = { onSelectCategory(barItems[2].category) },
-                    modifier = Modifier.weight(1f)
-                )
-                PosStatPillCard(
-                    item = barItems[3],
-                    isSelected = selectedCategory == barItems[3].category,
-                    onClick = { onSelectCategory(barItems[3].category) },
-                    modifier = Modifier.weight(1f)
-                )
-                PosStatPillCard(
-                    item = barItems[4],
-                    isSelected = selectedCategory == barItems[4].category,
-                    onClick = { onSelectCategory(barItems[4].category) },
-                    modifier = Modifier.weight(1f)
-                )
-            }
-
-            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
-
-            // 5. Final Output: RADJPRON & RADVADJ Stylometric Ratios + Logistic Regression Fiction vs. Non-Fiction Prediction
-            OcrFictionPredictionFinalOutputCard(
-                posBreakdown = posBreakdown,
-                modifier = Modifier.fillMaxWidth()
-            )
         }
+
+        // Card B: Final Output — Fiction vs. Non-Fiction Prediction
+        OcrFictionPredictionFinalOutputCard(
+            posBreakdown = posBreakdown,
+            modifier = Modifier.fillMaxWidth()
+        )
     }
 }
 
@@ -1949,29 +1914,31 @@ private fun OcrFictionPredictionFinalOutputCard(
         String.format(Locale.US, "%.4f", posBreakdown.probabilityOfFiction)
     }
     val probFictionPercentStr = remember(posBreakdown.probabilityOfFiction) {
-        String.format(Locale.US, "%.2f%%", posBreakdown.probabilityOfFiction * 100.0)
+        String.format(Locale.US, "%.1f%%", posBreakdown.probabilityOfFiction * 100.0)
     }
     val probNonFictionPercentStr = remember(posBreakdown.probabilityOfFiction) {
-        String.format(Locale.US, "%.2f%%", (1.0 - posBreakdown.probabilityOfFiction) * 100.0)
+        String.format(Locale.US, "%.1f%%", (1.0 - posBreakdown.probabilityOfFiction) * 100.0)
     }
 
     val isFiction = posBreakdown.isFictionPredicted
     val accentColor = if (isFiction) PosAdverbViolet else PosVerbCyan
     val badgeBgColor = if (isFiction) PosAdverbVioletHighlight else PosVerbCyanHighlight
 
-    Surface(
-        shape = MaterialTheme.shapes.small,
-        color = MaterialTheme.colorScheme.surface,
-        border = BorderStroke(1.5.dp, accentColor.copy(alpha = 0.75f)),
+    Card(
+        shape = MaterialTheme.shapes.medium,
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        border = BorderStroke(1.25.dp, accentColor.copy(alpha = 0.65f)),
         modifier = modifier.testTag("ocr_fiction_prediction_card")
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+                .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            // Header + Predicted Genre Badge
+            // 1. Clean Hero Header: Title + Predicted Verdict Pill
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -1979,13 +1946,13 @@ private fun OcrFictionPredictionFinalOutputCard(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "FICTION VS. NON-FICTION PREDICTION",
-                        style = MaterialTheme.typography.labelMedium,
+                        text = "Genre Classification",
+                        style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.Bold,
-                        color = accentColor
+                        color = MaterialTheme.colorScheme.onSurface
                     )
                     Text(
-                        text = "Stylometric POS Ratio Logistic Regression Model",
+                        text = "Based on RADJPRON & RADVADJ ratios",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -2002,181 +1969,42 @@ private fun OcrFictionPredictionFinalOutputCard(
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = FontWeight.Bold,
                         color = accentColor,
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 5.dp)
                     )
                 }
             }
 
-            // Two POS Ratio Cards: RADJPRON & RADVADJ
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Surface(
-                    shape = MaterialTheme.shapes.extraSmall,
-                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("ocr_ratio_radjpron")
-                ) {
-                    Column(
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
-                        verticalArrangement = Arrangement.spacedBy(2.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = "RADJPRON",
-                                style = MaterialTheme.typography.labelSmall,
-                                fontWeight = FontWeight.Bold,
-                                color = PosAdjectiveEmerald
-                            )
-                            Text(
-                                text = "ADJ / PRON",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                        Text(
-                            text = rAdjPronStr,
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                        Text(
-                            text = if (posBreakdown.pronounCount > 0) {
-                                "${posBreakdown.adjectiveCount} ADJ / ${posBreakdown.pronounCount} PRON"
-                            } else {
-                                "${posBreakdown.adjectiveCount} ADJ / 0 PRON (1-floor)"
-                            },
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
-
-                Surface(
-                    shape = MaterialTheme.shapes.extraSmall,
-                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("ocr_ratio_radvadj")
-                ) {
-                    Column(
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
-                        verticalArrangement = Arrangement.spacedBy(2.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = "RADVADJ",
-                                style = MaterialTheme.typography.labelSmall,
-                                fontWeight = FontWeight.Bold,
-                                color = PosAdverbViolet
-                            )
-                            Text(
-                                text = "ADV / ADJ",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                        Text(
-                            text = rAdvAdjStr,
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                        Text(
-                            text = if (posBreakdown.adjectiveCount > 0) {
-                                "${posBreakdown.adverbCount} ADV / ${posBreakdown.adjectiveCount} ADJ"
-                            } else {
-                                "${posBreakdown.adverbCount} ADV / 0 ADJ (1-floor)"
-                            },
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
-            }
-
-            // Formula & Computed Values Box (z and Probability of Fiction)
-            Surface(
-                shape = MaterialTheme.shapes.extraSmall,
-                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f)),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(10.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    Text(
-                        text = "z = 1.7501 + (-4.3818 × RADJPRON) + (2.0998 × RADVADJ)",
-                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Text(
-                        text = "z = 1.7501 + (-4.3818 × $rAdjPronStr) + (2.0998 × $rAdvAdjStr) = $zStr",
-                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        modifier = Modifier.testTag("ocr_fiction_logit_z")
-                    )
-
-                    HorizontalDivider(
-                        modifier = Modifier.padding(vertical = 4.dp),
-                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
-                    )
-
-                    Text(
-                        text = "Probability of Fiction = 1 / (1 + e^(-z))",
-                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(
-                            text = "Probability of Fiction:",
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.SemiBold,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                        Text(
-                            text = "$probFictionDecimalStr ($probFictionPercentStr)",
-                            style = MaterialTheme.typography.titleSmall.copy(fontFamily = FontFamily.Monospace),
-                            fontWeight = FontWeight.Bold,
-                            color = accentColor,
-                            modifier = Modifier.testTag("ocr_probability_of_fiction")
-                        )
-                    }
-                }
-            }
-
-            // Visual Probability Gauge Bar (Non-Fiction vs. Fiction)
+            // 2. Probability of Fiction Hero Readout + Clean Progress Bar
             Column(
                 modifier = Modifier.fillMaxWidth(),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
+                verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.Bottom
+                ) {
+                    Text(
+                        text = "Probability of Fiction",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        text = "$probFictionPercentStr ($probFictionDecimalStr)",
+                        style = MaterialTheme.typography.titleMedium.copy(fontFamily = FontFamily.Monospace),
+                        fontWeight = FontWeight.Bold,
+                        color = accentColor,
+                        modifier = Modifier.testTag("ocr_probability_of_fiction")
+                    )
+                }
+
                 val fictionFraction = posBreakdown.probabilityOfFiction.toFloat().coerceIn(0f, 1f)
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(10.dp)
+                        .height(8.dp)
                         .clip(CircleShape)
-                        .background(PosVerbCyan.copy(alpha = 0.28f))
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
                 ) {
                     Box(
                         modifier = Modifier
@@ -2189,26 +2017,112 @@ private fun OcrFictionPredictionFinalOutputCard(
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text(
-                        text = "Non-Fiction: $probNonFictionPercentStr",
+                        text = "Non-Fiction ($probNonFictionPercentStr)",
                         style = MaterialTheme.typography.labelSmall,
-                        fontWeight = if (!isFiction) FontWeight.Bold else FontWeight.Normal,
                         color = if (!isFiction) PosVerbCyan else MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Text(
-                        text = "Final Verdict: ${posBreakdown.predictedGenreLabel}",
+                        text = "Fiction ($probFictionPercentStr)",
                         style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.Bold,
-                        color = accentColor
+                        color = if (isFiction) PosAdverbViolet else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            // 3. Two Clean Side-by-Side Ratio Tiles: RADJPRON & RADVADJ
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Surface(
+                    shape = MaterialTheme.shapes.small,
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("ocr_ratio_radjpron")
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        Text(
+                            text = "RADJPRON (ADJ / PRON)",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = PosAdjectiveEmerald
+                        )
+                        Text(
+                            text = rAdjPronStr,
+                            style = MaterialTheme.typography.titleMedium.copy(fontFamily = FontFamily.Monospace),
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = "${posBreakdown.adjectiveCount} Adj / ${posBreakdown.pronounCount} Pron",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                Surface(
+                    shape = MaterialTheme.shapes.small,
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("ocr_ratio_radvadj")
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        Text(
+                            text = "RADVADJ (ADV / ADJ)",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = PosAdverbViolet
+                        )
+                        Text(
+                            text = rAdvAdjStr,
+                            style = MaterialTheme.typography.titleMedium.copy(fontFamily = FontFamily.Monospace),
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = "${posBreakdown.adverbCount} Adv / ${posBreakdown.adjectiveCount} Adj",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+
+            // 4. Compact Logistic Equation Readout
+            Surface(
+                shape = MaterialTheme.shapes.small,
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.25f),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 10.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    Text(
+                        text = "z = 1.7501 - 4.3818($rAdjPronStr) + 2.0998($rAdvAdjStr) = $zStr",
+                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.testTag("ocr_fiction_logit_z")
                     )
                     Text(
-                        text = "Fiction: $probFictionPercentStr",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = if (isFiction) FontWeight.Bold else FontWeight.Normal,
-                        color = if (isFiction) PosAdverbViolet else MaterialTheme.colorScheme.onSurfaceVariant
+                        text = "P(Fiction) = 1 / (1 + e^(-z)) = $probFictionDecimalStr",
+                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }
@@ -2225,29 +2139,29 @@ private fun PosLegendChip(
     testTag: String
 ) {
     Surface(
-        shape = MaterialTheme.shapes.extraSmall,
+        shape = CircleShape,
         color = if (isSelected) {
-            swatchColor.copy(alpha = 0.24f)
+            swatchColor.copy(alpha = 0.22f)
         } else {
-            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)
+            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
         },
         border = BorderStroke(
-            width = if (isSelected) 1.5.dp else 1.dp,
-            color = if (isSelected) swatchColor else MaterialTheme.colorScheme.outlineVariant
+            width = 1.dp,
+            color = if (isSelected) swatchColor else Color.Transparent
         ),
         modifier = Modifier
-            .clip(MaterialTheme.shapes.extraSmall)
+            .clip(CircleShape)
             .clickable(onClick = onClick)
             .testTag(testTag)
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(5.dp)
         ) {
             Box(
                 modifier = Modifier
-                    .size(10.dp)
+                    .size(8.dp)
                     .clip(CircleShape)
                     .background(swatchColor)
             )
@@ -2264,209 +2178,99 @@ private fun PosLegendChip(
 @Composable
 private fun OcrPosBarGraphCard(
     barItems: List<PosBarItem>,
-    totalWords: Int,
     selectedCategory: MajorPosCategory?,
     onSelectCategory: (MajorPosCategory?) -> Unit
 ) {
     val maxCount = remember(barItems) {
         max(1, barItems.maxOfOrNull { it.count } ?: 1)
     }
-    val trackColor = MaterialTheme.colorScheme.surfaceVariant
+    val trackColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)
 
     Surface(
         shape = MaterialTheme.shapes.small,
-        color = MaterialTheme.colorScheme.surface,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.25f),
         modifier = Modifier
             .fillMaxWidth()
             .testTag("ocr_pos_bar_graph")
     ) {
-        Column(
+        Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+                .height(128.dp)
+                .padding(horizontal = 10.dp, vertical = 10.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.Bottom
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text(
-                    text = "POS TAG DISTRIBUTION BAR GRAPH",
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.primary
-                )
-                Text(
-                    text = "Tap any bar to highlight its words",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
+            barItems.forEach { item ->
+                val fraction = (item.count.toFloat() / maxCount.toFloat()).coerceIn(0f, 1f)
+                val isHighlighted = selectedCategory == null || selectedCategory == item.category
+                val effectiveBarColor = if (isHighlighted) {
+                    item.barColor
+                } else {
+                    item.barColor.copy(alpha = 0.3f)
+                }
 
-            // 1. Vertical 5-Column Bar Chart with Canvas bars & count headers
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(132.dp)
-                    .padding(top = 4.dp),
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                verticalAlignment = Alignment.Bottom
-            ) {
-                barItems.forEach { item ->
-                    val fraction = (item.count.toFloat() / maxCount.toFloat()).coerceIn(0f, 1f)
-                    val isHighlighted = selectedCategory == null || selectedCategory == item.category
-                    val effectiveBarColor = if (isHighlighted) {
-                        item.barColor
-                    } else {
-                        item.barColor.copy(alpha = 0.35f)
-                    }
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                        .clip(MaterialTheme.shapes.extraSmall)
+                        .clickable { onSelectCategory(item.category) }
+                        .testTag(item.barTestTag),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Bottom
+                ) {
+                    Text(
+                        text = item.count.toString(),
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = effectiveBarColor
+                    )
 
-                    Column(
+                    Spacer(modifier = Modifier.height(4.dp))
+
+                    Box(
                         modifier = Modifier
                             .weight(1f)
-                            .fillMaxHeight()
-                            .clip(MaterialTheme.shapes.extraSmall)
-                            .clickable { onSelectCategory(item.category) }
-                            .padding(horizontal = 2.dp, vertical = 2.dp)
-                            .testTag(item.barTestTag),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.Bottom
+                            .fillMaxWidth(),
+                        contentAlignment = Alignment.BottomCenter
                     ) {
-                        Text(
-                            text = item.count.toString(),
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = effectiveBarColor
-                        )
-
-                        Spacer(modifier = Modifier.height(4.dp))
-
-                        Box(
+                        ComposeCanvas(
                             modifier = Modifier
-                                .weight(1f)
-                                .fillMaxWidth(),
-                            contentAlignment = Alignment.BottomCenter
+                                .fillMaxSize()
+                                .padding(horizontal = 8.dp)
                         ) {
-                            ComposeCanvas(
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .padding(horizontal = 6.dp)
-                            ) {
-                                val cornerRadius = CornerRadius(6.dp.toPx(), 6.dp.toPx())
-                                // Background bar track
-                                drawRoundRect(
-                                    color = trackColor,
-                                    topLeft = Offset.Zero,
-                                    size = size,
-                                    cornerRadius = cornerRadius
-                                )
-                                // Active POS count bar
-                                val minBarHeightPx = if (item.count > 0) 8.dp.toPx() else 3.dp.toPx()
-                                val barHeightPx = max(minBarHeightPx, size.height * fraction)
-                                drawRoundRect(
-                                    color = effectiveBarColor,
-                                    topLeft = Offset(0f, size.height - barHeightPx),
-                                    size = Size(size.width, barHeightPx),
-                                    cornerRadius = cornerRadius
-                                )
-                            }
-                        }
-
-                        Spacer(modifier = Modifier.height(5.dp))
-
-                        Text(
-                            text = item.shortTag,
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onSurface,
-                            maxLines = 1
-                        )
-                        Text(
-                            text = item.colorName,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = effectiveBarColor,
-                            maxLines = 1
-                        )
-                    }
-                }
-            }
-
-            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f))
-
-            // 2. Horizontal Bar Rows showing Count + Share of Total Words
-            Column(
-                modifier = Modifier.fillMaxWidth(),
-                verticalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                barItems.forEach { item ->
-                    val sharePercent = if (totalWords > 0) {
-                        ((item.count.toFloat() / totalWords.toFloat()) * 100f).roundToInt()
-                    } else {
-                        0
-                    }
-                    val barFraction = (item.count.toFloat() / maxCount.toFloat()).coerceIn(0f, 1f)
-                    val isHighlighted = selectedCategory == null || selectedCategory == item.category
-                    val barColor = if (isHighlighted) item.barColor else item.barColor.copy(alpha = 0.35f)
-
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(MaterialTheme.shapes.extraSmall)
-                            .clickable { onSelectCategory(item.category) }
-                            .padding(vertical = 2.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.width(104.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(10.dp)
-                                    .clip(CircleShape)
-                                    .background(barColor)
+                            val cornerRadius = CornerRadius(6.dp.toPx(), 6.dp.toPx())
+                            drawRoundRect(
+                                color = trackColor,
+                                topLeft = Offset.Zero,
+                                size = size,
+                                cornerRadius = cornerRadius
                             )
-                            Text(
-                                text = item.label,
-                                style = MaterialTheme.typography.labelSmall,
-                                fontWeight = FontWeight.SemiBold,
-                                color = MaterialTheme.colorScheme.onSurface,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
+                            val minBarHeightPx = if (item.count > 0) 8.dp.toPx() else 3.dp.toPx()
+                            val barHeightPx = max(minBarHeightPx, size.height * fraction)
+                            drawRoundRect(
+                                color = effectiveBarColor,
+                                topLeft = Offset(0f, size.height - barHeightPx),
+                                size = Size(size.width, barHeightPx),
+                                cornerRadius = cornerRadius
                             )
                         }
-
-                        Box(
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(10.dp)
-                                .clip(CircleShape)
-                                .background(trackColor)
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxHeight()
-                                    .fillMaxWidth(
-                                        fraction = if (item.count > 0) max(0.06f, barFraction) else 0f
-                                    )
-                                    .clip(CircleShape)
-                                    .background(barColor)
-                            )
-                        }
-
-                        Text(
-                            text = "${item.count} ($sharePercent%)",
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.Bold,
-                            color = barColor,
-                            textAlign = TextAlign.End,
-                            modifier = Modifier.width(62.dp)
-                        )
                     }
+
+                    Spacer(modifier = Modifier.height(5.dp))
+
+                    Text(
+                        text = item.shortTag,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (isHighlighted) {
+                            MaterialTheme.colorScheme.onSurface
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                        maxLines = 1
+                    )
                 }
             }
         }
@@ -2474,91 +2278,73 @@ private fun OcrPosBarGraphCard(
 }
 
 @Composable
-private fun PosStatPillCard(
+private fun PosCompactRowItem(
     item: PosBarItem,
+    totalWords: Int,
     isSelected: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier
+    onClick: () -> Unit
 ) {
+    val sharePercent = if (totalWords > 0) {
+        ((item.count.toFloat() / totalWords.toFloat()) * 100f).roundToInt()
+    } else {
+        0
+    }
+
     Surface(
-        shape = MaterialTheme.shapes.small,
+        shape = MaterialTheme.shapes.extraSmall,
         color = if (isSelected) {
-            item.highlightBgColor.copy(alpha = 0.25f)
+            item.highlightBgColor.copy(alpha = 0.2f)
         } else {
-            MaterialTheme.colorScheme.surface
+            Color.Transparent
         },
-        border = BorderStroke(
-            width = if (isSelected) 1.5.dp else 1.dp,
-            color = item.barColor.copy(alpha = if (isSelected) 0.95f else 0.55f)
-        ),
-        modifier = modifier
-            .clip(MaterialTheme.shapes.small)
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(MaterialTheme.shapes.extraSmall)
             .clickable(onClick = onClick)
             .testTag(item.cardTestTag)
     ) {
-        Column(
+        Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 10.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp)
+                .padding(horizontal = 6.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(5.dp),
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(9.dp)
-                            .clip(CircleShape)
-                            .background(item.barColor)
-                    )
-                    Text(
-                        text = item.label,
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-                Text(
-                    text = item.shortTag,
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.Bold,
-                    color = item.barColor
-                )
-            }
-
-            Text(
-                text = item.count.toString(),
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-                color = item.barColor
+            Box(
+                modifier = Modifier
+                    .size(10.dp)
+                    .clip(CircleShape)
+                    .background(item.barColor)
             )
 
-            if (item.examples.isNotEmpty()) {
-                Text(
-                    text = item.examples.take(3).joinToString(", "),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-            } else {
-                Text(
-                    text = "None detected",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-            }
+            Text(
+                text = item.label,
+                style = MaterialTheme.typography.bodySmall,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.width(76.dp)
+            )
+
+            Text(
+                text = if (item.examples.isNotEmpty()) {
+                    item.examples.take(3).joinToString(", ")
+                } else {
+                    "—"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
+
+            Text(
+                text = "${item.count} ($sharePercent%)",
+                style = MaterialTheme.typography.labelMedium.copy(fontFamily = FontFamily.Monospace),
+                fontWeight = FontWeight.Bold,
+                color = item.barColor,
+                textAlign = TextAlign.End
+            )
         }
     }
 }
