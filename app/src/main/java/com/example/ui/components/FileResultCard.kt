@@ -19,6 +19,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.DocumentScanner
 import androidx.compose.material.icons.filled.FilterAltOff
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.QuestionAnswer
@@ -276,11 +277,13 @@ fun FileInspectorBottomSheet(
     onShareFile: (PhoneFileItem) -> Unit,
     onDismiss: () -> Unit,
     onOpenPdf: ((PhoneFileItem) -> Unit)? = null,
-    onChatPdf: ((PhoneFileItem) -> Unit)? = null
+    onChatPdf: ((PhoneFileItem) -> Unit)? = null,
+    onExtractImageOcr: ((PhoneFileItem) -> Unit)? = null
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val isPdfFile = file.category == com.example.model.FileCategory.PDF ||
         file.extension.equals("pdf", ignoreCase = true)
+    val isImageFile = file.category == com.example.model.FileCategory.IMAGE
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -375,6 +378,27 @@ fun FileInspectorBottomSheet(
                             )
                         }
                     }
+                }
+            }
+
+            if (isImageFile && onExtractImageOcr != null) {
+                FilledTonalButton(
+                    onClick = { onExtractImageOcr(file) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .minimumInteractiveComponentSize()
+                        .testTag("inspector_extract_image_ocr_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.DocumentScanner,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.size(8.dp))
+                    Text(
+                        text = stringResource(R.string.scan_text_ocr_button),
+                        fontWeight = FontWeight.Bold
+                    )
                 }
             }
 

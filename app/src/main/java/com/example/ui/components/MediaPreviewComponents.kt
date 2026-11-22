@@ -38,6 +38,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.DocumentScanner
 import androidx.compose.material.icons.filled.Forward10
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Info
@@ -368,7 +369,8 @@ fun FullScreenImageViewerDialog(
     onCopyPath: (String) -> Unit,
     onShareFile: (PhoneFileItem) -> Unit,
     onOpenMetadata: (PhoneFileItem) -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    onExtractImageOcr: ((PhoneFileItem) -> Unit)? = null
 ) {
     val context = LocalContext.current
     val fullBitmap by produceState<Bitmap?>(initialValue = null, key1 = file.fullPath) {
@@ -496,6 +498,19 @@ fun FullScreenImageViewerDialog(
                                         imageVector = Icons.Default.ZoomOutMap,
                                         contentDescription = "Reset zoom",
                                         tint = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                            }
+
+                            if (onExtractImageOcr != null) {
+                                IconButton(
+                                    onClick = { onExtractImageOcr(file) },
+                                    modifier = Modifier.testTag("viewer_extract_image_ocr_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.DocumentScanner,
+                                        contentDescription = stringResource(R.string.scan_text_ocr_button),
+                                        tint = Color(0xFF38BDF8)
                                     )
                                 }
                             }

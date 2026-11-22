@@ -36,8 +36,10 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -58,6 +60,7 @@ import com.example.ui.components.EmptyFilesState
 import com.example.ui.components.FileControlHeader
 import com.example.ui.components.FileInspectorBottomSheet
 import com.example.ui.components.FileResultCard
+import com.example.ui.components.FullScreenImageOcrScannerDialog
 import com.example.ui.components.FullScreenImageViewerDialog
 import com.example.ui.components.FullScreenPdfChatDialog
 import com.example.ui.components.FullScreenPdfReaderDialog
@@ -114,14 +117,22 @@ fun FileFinderScreen(
         }
     }
 
+    var showImageOcrScanner by remember { mutableStateOf(false) }
+    var initialOcrImageFile by remember { mutableStateOf<PhoneFileItem?>(null) }
+
     BackHandler(
-        enabled = uiState.activePdfChatFile != null ||
+        enabled = showImageOcrScanner ||
+            uiState.activePdfChatFile != null ||
             uiState.activePdfReaderFile != null ||
             uiState.selectedInspectorFile != null ||
             uiState.activeMediaPreviewFile != null ||
             uiState.selectedMainTab != AppMainTab.STANDARD
     ) {
         when {
+            showImageOcrScanner -> {
+                showImageOcrScanner = false
+                initialOcrImageFile = null
+            }
             uiState.activePdfChatFile != null -> viewModel.closePdfChat()
             uiState.activePdfReaderFile != null -> viewModel.closePdfReader()
             uiState.selectedInspectorFile != null -> viewModel.closeFileInspector()
@@ -290,7 +301,11 @@ fun FileFinderScreen(
                                 onSearchQueryChange = viewModel::updateSearchQuery,
                                 onGrantAllFilesAccess = launchAllFilesAccessSettings,
                                 onToggleSampleIndex = viewModel::toggleIncludeSampleIndex,
-                                onRescan = viewModel::rescanStorage
+                                onRescan = viewModel::rescanStorage,
+                                onOpenImageOcrScanner = {
+                                    initialOcrImageFile = null
+                                    showImageOcrScanner = true
+                                }
                             )
                         }
 
@@ -367,6 +382,10 @@ fun FileFinderScreen(
                         onCopyPath = copyPathToClipboard,
                         onShareFile = shareFileWithApps,
                         onOpenPdfChat = viewModel::openPdfChat,
+                        onOpenImageOcrScanner = {
+                            initialOcrImageFile = null
+                            showImageOcrScanner = true
+                        },
                         modifier = Modifier.widthIn(max = 760.dp)
                     )
                 }
@@ -407,7 +426,12 @@ fun FileFinderScreen(
                             onOpenMetadata = { file ->
                                 viewModel.openFileInspector(file)
                             },
-                            onDismiss = viewModel::closeMediaPreview
+                            onDismiss = viewModel::closeMediaPreview,
+                            onExtractImageOcr = { file ->
+                                viewModel.closeMediaPreview()
+                                initialOcrImageFile = file
+                                showImageOcrScanner = true
+                            }
                         )
                     }
                     FileCategory.VIDEO -> {
@@ -457,7 +481,23 @@ fun FileFinderScreen(
                     onShareFile = shareFileWithApps,
                     onDismiss = viewModel::closeFileInspector,
                     onOpenPdf = viewModel::openPdfReader,
-                    onChatPdf = viewModel::openPdfChat
+                    onChatPdf = viewModel::openPdfChat,
+                    onExtractImageOcr = { file ->
+                        viewModel.closeFileInspector()
+                        initialOcrImageFile = file
+                        showImageOcrScanner = true
+                    }
+                )
+            }
+
+            // On-Device Image Text Scanner (OCR) Dialog for taking a picture or uploading an image
+            if (showImageOcrScanner) {
+                FullScreenImageOcrScannerDialog(
+                    initialFile = initialOcrImageFile,
+                    onDismiss = {
+                        showImageOcrScanner = false
+                        initialOcrImageFile = null
+                    }
                 )
             }
         }

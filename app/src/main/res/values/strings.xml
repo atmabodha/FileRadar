@@ -30,4 +30,12 @@
     <string name="chat_engine_local_gemma">Local Gemma E2B</string>
     <string name="chat_engine_gemini_subscription">Gemini Subscription</string>
     <string name="firebase_required_notice">Connected to keyless Firebase AI Logic (gemini-3.8-flash Free Tier). No GEMINI_API_KEY is used and no paid billing is required.</string>
+    <string name="scan_text_ocr_button">Scan Text (OCR)</string>
+    <string name="image_ocr_scanner_title">Image Text Scanner (OCR)</string>
+    <string name="image_ocr_scanner_subtitle">Take a picture of any written text or upload an image to extract text on-device</string>
+    <string name="ocr_take_photo_action">Take Picture</string>
+    <string name="ocr_upload_image_action">Upload Image</string>
+    <string name="ocr_copy_extracted_text">Copy Text</string>
+    <string name="ocr_share_extracted_text">Share Text</string>
+    <string name="ocr_extracted_text_copied">Extracted text copied to clipboard</string>
 </resources>

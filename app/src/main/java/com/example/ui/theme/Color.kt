@@ -31,3 +31,30 @@ val DeepAmberLight = Color(0xFFD97706)
 val DeepEmeraldLight = Color(0xFF059669)
 val InkDarkText = Color(0xFF0F172A)
 val InkMutedText = Color(0xFF475569)
+
+// Part-of-Speech (POS) Bar Graph & Word Highlight Colors
+// Noun -> Yellow (as requested: "eg. if noun bar is shown using yellow, highlight all nouns using yellow")
+val PosNounYellow = Color(0xFFFACC15)
+val PosNounYellowHighlight = Color(0x59FACC15)
+val PosNounYellowBadgeText = Color(0xFFFEF08A)
+
+// Verb -> Cyan Blue
+val PosVerbCyan = Color(0xFF38BDF8)
+val PosVerbCyanHighlight = Color(0x5238BDF8)
+val PosVerbCyanBadgeText = Color(0xFFBAE6FD)
+
+// Adjective -> Emerald Green
+val PosAdjectiveEmerald = Color(0xFF34D399)
+val PosAdjectiveEmeraldHighlight = Color(0x5234D399)
+val PosAdjectiveEmeraldBadgeText = Color(0xFFA7F3D0)
+
+// Adverb -> Electric Violet
+val PosAdverbViolet = Color(0xFFC084FC)
+val PosAdverbVioletHighlight = Color(0x52C084FC)
+val PosAdverbVioletBadgeText = Color(0xFFE9D5FF)
+
+// Pronoun -> Coral Rose
+val PosPronounRose = Color(0xFFFB7185)
+val PosPronounRoseHighlight = Color(0x52FB7185)
+val PosPronounRoseBadgeText = Color(0xFFFECDD3)
+

@@ -32,6 +32,7 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CleaningServices
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.DocumentScanner
 import androidx.compose.material.icons.filled.DriveFileRenameOutline
 import androidx.compose.material.icons.filled.Forum
 import androidx.compose.material.icons.filled.PowerSettingsNew
@@ -45,6 +46,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -135,6 +137,7 @@ fun AiSearchScreen(
     onCopyPath: (String) -> Unit,
     onShareFile: (PhoneFileItem) -> Unit,
     onOpenPdfChat: ((PhoneFileItem) -> Unit)? = null,
+    onOpenImageOcrScanner: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     // Graceful degradation when Master AI Kill Switch is OFF
@@ -193,6 +196,26 @@ fun AiSearchScreen(
                             text = "${aiSettings.totalVectorChunks} vector chunks (${aiSettings.indexedFileCount} files) • RAM ${hardware.availableRamGb}/${hardware.totalRamGb} GB",
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+
+                    FilledTonalButton(
+                        onClick = onOpenImageOcrScanner,
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                        modifier = Modifier
+                            .height(40.dp)
+                            .testTag("ai_open_image_ocr_scanner_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.DocumentScanner,
+                            contentDescription = "Scan Text (OCR)",
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Scan Text (OCR)",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.SemiBold
                         )
                     }
                 }

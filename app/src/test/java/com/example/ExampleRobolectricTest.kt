@@ -353,6 +353,100 @@ class ExampleRobolectricTest {
         assertTrue(turn2Reply.text.contains("13.2 - 16.6") || turn2Reply.text.contains("14.8 g/dL"))
         assertTrue(turn2Reply.text.contains("Follow-up Context"))
     }
+
+    @Test
+    fun `clicking Scan Text OCR button opens Image Text Scanner with Take Picture and Upload Image options`() {
+        composeTestRule.onNodeWithTag("open_image_ocr_scanner_button")
+            .assertIsDisplayed()
+            .performClick()
+
+        composeTestRule.onNodeWithTag("image_ocr_scanner_dialog")
+            .assertIsDisplayed()
+
+        composeTestRule.onNodeWithTag("ocr_take_photo_button")
+            .assertIsDisplayed()
+
+        composeTestRule.onNodeWithTag("ocr_upload_image_button")
+            .assertIsDisplayed()
+
+        composeTestRule.onNodeWithTag("ocr_high_contrast_toggle")
+            .assertIsDisplayed()
+
+        composeTestRule.onNodeWithTag("close_image_ocr_scanner_button")
+            .assertIsDisplayed()
+            .performClick()
+    }
+
+    @Test
+    fun `on-device POS tagger accurately counts total words, nouns, verbs, adjectives, adverbs, pronouns and highlights spans with matching bar colors`() {
+        val sampleOcrText =
+            "They quickly verified our clinical report and confirmed that the normal hemoglobin value is completely valid."
+        val breakdown = com.example.ui.components.OnDevicePosTagger.analyzeText(sampleOcrText)
+
+        assertEquals(16, breakdown.totalWords)
+        assertEquals(16, breakdown.wordSpans.size)
+        assertTrue(breakdown.pronounCount >= 2)   // "They", "our", "that"
+        assertTrue(breakdown.adverbCount >= 2)    // "quickly", "completely"
+        assertTrue(breakdown.verbCount >= 3)      // "verified", "confirmed", "is"
+        assertTrue(breakdown.adjectiveCount >= 3) // "clinical", "normal", "valid"
+        assertTrue(breakdown.nounCount >= 2)      // "report", "hemoglobin", "value"
+
+        // Verify Noun bar color is Yellow and every Noun span is highlighted with Yellow
+        assertEquals(
+            com.example.ui.theme.PosNounYellow,
+            com.example.ui.components.OnDevicePosTagger.barColorFor(
+                com.example.ui.components.MajorPosCategory.NOUN
+            )
+        )
+
+        val annotatedAll = com.example.ui.components.OnDevicePosTagger.buildPosHighlightedAnnotatedString(
+            text = sampleOcrText,
+            wordSpans = breakdown.wordSpans,
+            activeCategoryFilter = null
+        )
+        assertEquals(sampleOcrText, annotatedAll.text)
+        assertTrue(annotatedAll.spanStyles.isNotEmpty())
+
+        // Filter specifically to NOUN and verify only noun spans get PosNounYellowHighlight background
+        val annotatedNounsOnly = com.example.ui.components.OnDevicePosTagger.buildPosHighlightedAnnotatedString(
+            text = sampleOcrText,
+            wordSpans = breakdown.wordSpans,
+            activeCategoryFilter = com.example.ui.components.MajorPosCategory.NOUN
+        )
+        assertEquals(breakdown.nounCount, annotatedNounsOnly.spanStyles.size)
+        assertTrue(
+            annotatedNounsOnly.spanStyles.all {
+                it.item.background == com.example.ui.theme.PosNounYellowHighlight
+            }
+        )
+
+        // Verify exact RADJPRON, RADVADJ, z, and Probability of Fiction formula
+        val expectedRAdjPron = breakdown.adjectiveCount.toDouble() / breakdown.pronounCount.toDouble()
+        val expectedRAdvAdj = breakdown.adverbCount.toDouble() / breakdown.adjectiveCount.toDouble()
+        val expectedZ = 1.7501 + (-4.3818 * expectedRAdjPron) + (2.0998 * expectedRAdvAdj)
+        val expectedProbFiction = 1.0 / (1.0 + kotlin.math.exp(-expectedZ))
+
+        assertEquals(expectedRAdjPron, breakdown.rAdjPron, 1e-6)
+        assertEquals(expectedRAdvAdj, breakdown.rAdvAdj, 1e-6)
+        assertEquals(expectedZ, breakdown.logitZ, 1e-6)
+        assertEquals(expectedProbFiction, breakdown.probabilityOfFiction, 1e-6)
+
+        // Verify a heavy technical non-fiction passage predicts Non-Fiction (high RADJPRON, low RADVADJ)
+        val nonFictionBreakdown = com.example.ui.components.OnDevicePosTagger.analyzeText(
+            "Clinical diagnostic metabolic hematological panel shows normal annual fasting glucose range."
+        )
+        assertFalse(nonFictionBreakdown.isFictionPredicted)
+        assertEquals("Non-Fiction", nonFictionBreakdown.predictedGenreLabel)
+
+        // Verify a pronoun- and adverb-rich narrative passage predicts Fiction (low RADJPRON, high RADVADJ)
+        val fictionBreakdown = com.example.ui.components.OnDevicePosTagger.analyzeText(
+            "She quietly walked to him and they suddenly ran away together."
+        )
+        assertTrue(fictionBreakdown.isFictionPredicted)
+        assertEquals("Fiction", fictionBreakdown.predictedGenreLabel)
+    }
 }
+
+
 
 
