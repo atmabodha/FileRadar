@@ -29,7 +29,7 @@
     <string name="pdf_chat_title">PDF Document Chat</string>
     <string name="chat_engine_local_gemma">Local Gemma E2B</string>
     <string name="chat_engine_gemini_subscription">Gemini Subscription</string>
-    <string name="firebase_required_notice">Connected to keyless Firebase AI Logic (gemini-3.8-flash Free Tier). No GEMINI_API_KEY is used and no paid billing is required.</string>
+    <string name="firebase_required_notice">Powered by ultra-fast keyless Firebase AI Logic (gemini-3.5-flash-lite with automatic gemini-3.8-flash failover &amp; compact RAG prompts). No API key or paid billing required.</string>
     <string name="scan_text_ocr_button">Scan Text (OCR)</string>
     <string name="image_ocr_scanner_title">Image Text Scanner (OCR)</string>
     <string name="image_ocr_scanner_subtitle">Take a picture of any written text or upload an image to extract text on-device</string>

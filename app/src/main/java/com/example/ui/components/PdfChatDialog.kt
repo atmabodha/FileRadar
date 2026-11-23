@@ -38,6 +38,7 @@ import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Forum
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.PictureAsPdf
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
@@ -46,6 +47,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
@@ -67,11 +69,16 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.example.R
@@ -86,6 +93,7 @@ import com.example.pdfextractor.model.ExtractionSource
 import com.example.pdfextractor.model.TextChunk
 import com.google.firebase.Firebase
 import com.google.firebase.ai.ai
+import com.google.firebase.ai.type.generationConfig
 import java.util.Locale
 import kotlin.coroutines.cancellation.CancellationException
 import kotlin.math.ln
@@ -99,8 +107,9 @@ private const val TAG = "PdfChatAi"
 
 /**
  * Two selectable engines for chatting with a PDF document:
- * 1. [LOCAL_GEMMA_E2B]: 100% offline on-device Gemma E2B 4-bit RAG over hybrid-extracted PDF chunks (PDFBox + ML Kit OCR).
- * 2. [GEMINI_SUBSCRIPTION]: Keyless Firebase AI Logic (`gemini-3.8-flash` free tier — no API key or paid billing).
+ * 1. [LOCAL_GEMMA_E2B]: 100% offline on-device Gemma E2B 4-bit RAG over hybrid-extracted PDF chunks (instant, zero timeouts).
+ * 2. [GEMINI_SUBSCRIPTION]: Ultra-fast keyless Firebase AI Logic (`gemini-3.5-flash-lite` primary with compact RAG prompts
+ *    and automatic `gemini-3.8-flash` failover — no API key or paid billing required).
  */
 enum class PdfChatEngineOption(
     val displayName: String,
@@ -109,13 +118,13 @@ enum class PdfChatEngineOption(
 ) {
     LOCAL_GEMMA_E2B(
         displayName = "Local Gemma E2B",
-        subtitle = "On-Device Hybrid RAG • PDFBox + OCR",
+        subtitle = "Instant Offline • Zero Timeouts",
         badgeLabel = "Gemma E2B (On-Device RAG)"
     ),
     GEMINI_SUBSCRIPTION(
-        displayName = "Gemini (Keyless Free Tier)",
-        subtitle = "Firebase AI Logic • gemini-3.8-flash",
-        badgeLabel = "Gemini 3.8 Flash (Keyless)"
+        displayName = "Gemini Flash-Lite",
+        subtitle = "Ultra-Fast Free Cloud • Auto Failover",
+        badgeLabel = "Gemini 3.5 Flash-Lite (Fast Cloud)"
     )
 }
 
@@ -127,7 +136,8 @@ data class PdfChatMessage(
     val pageCitations: List<String> = emptyList(),
     val isSamplePlaceholder: Boolean = false,
     val isError: Boolean = false,
-    val isStreaming: Boolean = false
+    val isStreaming: Boolean = false,
+    val retryQuestion: String? = null
 )
 
 /**
@@ -143,14 +153,36 @@ interface PdfChatAiRepository {
 }
 
 /**
- * Production implementation using keyless Firebase AI Logic (`Firebase.ai`) with the free-tier
- * `gemini-3.8-flash` model (no API key required and no paid Blaze billing required).
+ * Production implementation using keyless Firebase AI Logic (`Firebase.ai`) engineered for
+ * ultra-low latency and high reliability:
+ * - Primary Engine: `gemini-3.5-flash-lite` (ultra-fast free-tier workhorse model, no billing required)
+ *   with compact RAG-compressed prompts (<= 3,000 chars) and `maxOutputTokens = 768` to eliminate stalls.
+ * - Tier 2 Failover: Compact unary `gemini-3.5-flash-lite` (<= 1,600 chars) if streaming stalls.
+ * - Tier 3 Failover: Compact unary `gemini-3.8-flash` (`maxOutputTokens = 640`) if Flash-Lite is congested.
+ * - Transparent Error Propagation: Never mocks cloud replies; if all cloud tiers fail, surfaces the
+ *   real error along with 1-tap Retry and Instant Offline (Local Gemma E2B) recovery actions.
  */
 class FirebaseAiLogicPdfChatRepository : PdfChatAiRepository {
 
     // Lazy initialization per Firebase AI Logic best practices
-    private val model by lazy {
-        Firebase.ai.generativeModel("gemini-3.8-flash")
+    private val fastLiteModel by lazy {
+        Firebase.ai.generativeModel(
+            modelName = "gemini-3.5-flash-lite",
+            generationConfig = generationConfig {
+                temperature = 0.2f
+                maxOutputTokens = 768
+            }
+        )
+    }
+
+    private val secondaryFlashModel by lazy {
+        Firebase.ai.generativeModel(
+            modelName = "gemini-3.8-flash",
+            generationConfig = generationConfig {
+                temperature = 0.2f
+                maxOutputTokens = 640
+            }
+        )
     }
 
     override suspend fun generateGeminiSubscriptionAnswer(
@@ -159,6 +191,9 @@ class FirebaseAiLogicPdfChatRepository : PdfChatAiRepository {
         question: String,
         onStreamUpdate: ((String, List<String>) -> Unit)?
     ): PdfChatMessage {
+        val extraction = withContext(Dispatchers.Default) {
+            buildExtractionResultFromRawPages(file, pagesText)
+        }
         val rankedPassages = withContext(Dispatchers.Default) {
             retrieveRelevantPdfPassages(pagesText, question)
         }
@@ -168,40 +203,33 @@ class FirebaseAiLogicPdfChatRepository : PdfChatAiRepository {
             pagesText.indices.take(4).map { "Page ${it + 1}" }
         }
 
-        // Build concise, grounded context from the PDF's cleaned pages and top sentence chunks
-        val pdfContext = buildString {
-            append("PDF File Name: ").append(file.name).append('\n')
-            append("Total Pages: ").append(pagesText.size).append("\n\n")
-            if (rankedPassages.isNotEmpty()) {
-                append("Top Matching Sentence Chunks:\n")
-                rankedPassages.forEach { passage ->
-                    append("- [Page ").append(passage.pageNumber).append("] ").append(passage.snippet).append('\n')
-                }
-                append('\n')
-            }
-            append("Cleaned Page Contents:\n")
-            pagesText.take(6).forEachIndexed { idx, pageText ->
-                append("--- PAGE ").append(idx + 1).append(" ---\n")
-                append(pageText.take(1400)).append("\n\n")
-            }
+        val primaryPrompt = withContext(Dispatchers.Default) {
+            buildCompactCloudPdfPrompt(
+                file = file,
+                extraction = extraction,
+                rankedPassages = rankedPassages,
+                question = question,
+                maxContextChars = 2_800
+            )
         }
-
-        val prompt = """
-            You are a helpful document assistant inside File Radar. Answer the user's question clearly and concisely using ONLY the provided PDF document content below.
-            Cite specific page numbers (e.g., [Page 1], [Page 2]) when referencing facts, numbers, or dates.
-            Use clean bullet points for readability when summarizing.
-
-            $pdfContext
-
-            User Question: $question
-        """.trimIndent()
+        val ultraCompactPrompt = withContext(Dispatchers.Default) {
+            buildCompactCloudPdfPrompt(
+                file = file,
+                extraction = extraction,
+                rankedPassages = rankedPassages,
+                question = question,
+                maxContextChars = 1_500
+            )
+        }
 
         val messageId = "gemini_${System.currentTimeMillis()}"
         val accumulatedText = StringBuilder()
 
-        return try {
-            withTimeout(45_000L) {
-                model.generateContentStream(prompt).collect { chunk ->
+        // Tier 1: Ultra-fast streaming via gemini-3.5-flash-lite (30s timeout)
+        var tier1FailureReason: String? = null
+        try {
+            withTimeout(30_000L) {
+                fastLiteModel.generateContentStream(primaryPrompt).collect { chunk ->
                     val chunkText = chunk.text.orEmpty()
                     if (chunkText.isNotEmpty()) {
                         accumulatedText.append(chunkText)
@@ -209,48 +237,24 @@ class FirebaseAiLogicPdfChatRepository : PdfChatAiRepository {
                     }
                 }
             }
-            val finalText = accumulatedText.toString().trim()
-            if (finalText.isNotEmpty()) {
-                PdfChatMessage(
+            val streamedFinal = accumulatedText.toString().trim()
+            if (streamedFinal.isNotEmpty()) {
+                return PdfChatMessage(
                     id = messageId,
                     isUser = false,
                     engine = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
-                    text = finalText,
+                    text = streamedFinal,
                     pageCitations = citations,
                     isSamplePlaceholder = false,
                     isError = false
                 )
-            } else {
-                val unaryResponse = withTimeout(30_000L) {
-                    model.generateContent(prompt)
-                }
-                val unaryText = unaryResponse.text?.trim().orEmpty()
-                if (unaryText.isNotEmpty()) {
-                    PdfChatMessage(
-                        id = messageId,
-                        isUser = false,
-                        engine = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
-                        text = unaryText,
-                        pageCitations = citations,
-                        isSamplePlaceholder = false,
-                        isError = false
-                    )
-                } else {
-                    PdfChatMessage(
-                        id = messageId,
-                        isUser = false,
-                        engine = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
-                        text = "Model returned an empty response. Please try asking your question again.",
-                        pageCitations = citations,
-                        isError = true
-                    )
-                }
             }
+            tier1FailureReason = "Empty stream from gemini-3.5-flash-lite"
         } catch (e: TimeoutCancellationException) {
-            Log.e(TAG, "Firebase AI PDF chat streaming timed out", e)
+            Log.w(TAG, "Tier 1 (gemini-3.5-flash-lite stream) timed out", e)
             val partial = accumulatedText.toString().trim()
-            if (partial.isNotEmpty()) {
-                PdfChatMessage(
+            if (partial.length >= 60) {
+                return PdfChatMessage(
                     id = messageId,
                     isUser = false,
                     engine = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
@@ -259,66 +263,72 @@ class FirebaseAiLogicPdfChatRepository : PdfChatAiRepository {
                     isSamplePlaceholder = false,
                     isError = false
                 )
-            } else {
-                try {
-                    val fallbackResponse = withTimeout(25_000L) {
-                        model.generateContent(prompt)
-                    }
-                    val fallbackText = fallbackResponse.text?.trim().orEmpty()
-                    if (fallbackText.isNotEmpty()) {
-                        PdfChatMessage(
-                            id = messageId,
-                            isUser = false,
-                            engine = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
-                            text = fallbackText,
-                            pageCitations = citations,
-                            isSamplePlaceholder = false,
-                            isError = false
-                        )
-                    } else {
-                        PdfChatMessage(
-                            id = messageId,
-                            isUser = false,
-                            engine = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
-                            text = "Generation timed out. Please try again or switch to Local Gemma E2B.",
-                            pageCitations = citations,
-                            isError = true
-                        )
-                    }
-                } catch (ce: CancellationException) {
-                    if (ce !is TimeoutCancellationException) throw ce
-                    PdfChatMessage(
-                        id = messageId,
-                        isUser = false,
-                        engine = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
-                        text = "Generation timed out after 60 seconds. Please try again or switch to Local Gemma E2B.",
-                        pageCitations = citations,
-                        isError = true
-                    )
-                } catch (inner: Exception) {
-                    Log.e(TAG, "Firebase AI unary fallback failed after timeout", inner)
-                    PdfChatMessage(
-                        id = messageId,
-                        isUser = false,
-                        engine = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
-                        text = inner.localizedMessage ?: "Generation timed out. Please try again or switch to Local Gemma E2B.",
-                        pageCitations = citations,
-                        isError = true
-                    )
-                }
             }
+            tier1FailureReason = "Fast stream timed out"
         } catch (e: CancellationException) {
-            // Always rethrow CancellationException to preserve cooperative coroutine cancellation
             throw e
         } catch (e: Exception) {
-            Log.e(TAG, "Firebase AI PDF chat generation failed", e)
+            Log.w(TAG, "Tier 1 (gemini-3.5-flash-lite stream) failed: ${e.localizedMessage}", e)
             val partial = accumulatedText.toString().trim()
-            if (partial.isNotEmpty()) {
-                PdfChatMessage(
+            if (partial.length >= 60) {
+                return PdfChatMessage(
                     id = messageId,
                     isUser = false,
                     engine = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
                     text = partial,
+                    pageCitations = citations,
+                    isSamplePlaceholder = false,
+                    isError = false
+                )
+            }
+            tier1FailureReason = e.localizedMessage ?: "Stream error"
+        }
+
+        // Tier 2: Compact unary retry on gemini-3.5-flash-lite (25s timeout)
+        onStreamUpdate?.invoke(
+            "Retrying with ultra-compact context on Gemini 3.5 Flash-Lite…",
+            citations
+        )
+        try {
+            val unaryLite = withTimeout(25_000L) {
+                fastLiteModel.generateContent(ultraCompactPrompt)
+            }
+            val text = unaryLite.text?.trim().orEmpty()
+            if (text.isNotEmpty()) {
+                return PdfChatMessage(
+                    id = messageId,
+                    isUser = false,
+                    engine = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
+                    text = text,
+                    pageCitations = citations,
+                    isSamplePlaceholder = false,
+                    isError = false
+                )
+            }
+        } catch (e: TimeoutCancellationException) {
+            Log.w(TAG, "Tier 2 (gemini-3.5-flash-lite unary) timed out", e)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Tier 2 (gemini-3.5-flash-lite unary) failed: ${e.localizedMessage}", e)
+        }
+
+        // Tier 3: Automatic secondary model failover to gemini-3.8-flash with ultra-compact prompt (30s timeout)
+        onStreamUpdate?.invoke(
+            "Failing over to Gemini 3.8 Flash (compact prompt)…",
+            citations
+        )
+        return try {
+            val fallbackResponse = withTimeout(30_000L) {
+                secondaryFlashModel.generateContent(ultraCompactPrompt)
+            }
+            val fallbackText = fallbackResponse.text?.trim().orEmpty()
+            if (fallbackText.isNotEmpty()) {
+                PdfChatMessage(
+                    id = messageId,
+                    isUser = false,
+                    engine = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
+                    text = fallbackText,
                     pageCitations = citations,
                     isSamplePlaceholder = false,
                     isError = false
@@ -328,13 +338,123 @@ class FirebaseAiLogicPdfChatRepository : PdfChatAiRepository {
                     id = messageId,
                     isUser = false,
                     engine = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
-                    text = e.localizedMessage ?: "Firebase AI generation failed.",
+                    text = "Cloud Gemini returned an empty response ($tier1FailureReason). Tap \"Answer Offline (Gemma E2B)\" below for an instant local answer.",
                     pageCitations = citations,
-                    isError = true
+                    isError = true,
+                    retryQuestion = question
                 )
             }
+        } catch (e: TimeoutCancellationException) {
+            Log.e(TAG, "All cloud Gemini tiers timed out (Flash-Lite + 3.8 Flash)", e)
+            PdfChatMessage(
+                id = messageId,
+                isUser = false,
+                engine = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
+                text = "Cloud Gemini timed out on both Flash-Lite and 3.8 Flash (slow network or server congestion). Tap \"Answer Offline (Gemma E2B)\" below for an instant structured response with zero timeouts.",
+                pageCitations = citations,
+                isError = true,
+                retryQuestion = question
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "All cloud Gemini tiers failed", e)
+            PdfChatMessage(
+                id = messageId,
+                isUser = false,
+                engine = PdfChatEngineOption.GEMINI_SUBSCRIPTION,
+                text = "${e.localizedMessage ?: "Cloud Gemini request failed."} Tap \"Answer Offline (Gemma E2B)\" below for an instant local answer.",
+                pageCitations = citations,
+                isError = true,
+                retryQuestion = question
+            )
         }
     }
+}
+
+/**
+ * Builds a dense, RAG-compressed prompt strictly bounded by [maxContextChars] so cloud Gemini
+ * calls have ultra-fast Time-To-First-Token and avoid timeouts even on multi-page PDFs.
+ */
+internal fun buildCompactCloudPdfPrompt(
+    file: PhoneFileItem,
+    extraction: DocumentExtractionResult,
+    rankedPassages: List<PdfPassageMatch>,
+    question: String,
+    maxContextChars: Int = 2_800
+): String {
+    val totalPages = extraction.pages.size.coerceAtLeast(1)
+    val lowerQ = question.lowercase(Locale.ROOT)
+    val isSummary = lowerQ.contains("summarize") || lowerQ.contains("summary") ||
+        lowerQ.contains("overview") || lowerQ.contains("what is this") || lowerQ.contains("main points")
+
+    val contextBody = buildString {
+        append("File: ").append(file.name)
+            .append(" (").append(totalPages).append(if (totalPages == 1) " page" else " pages")
+            .append(", Category: ").append(classifyDocumentCategory(file.name, extraction))
+            .append(")\n\n")
+
+        if (isSummary) {
+            // Balanced per-page extracts so ALL pages fit inside the fast context window
+            val perPageBudget = (maxContextChars / totalPages.coerceAtMost(8)).coerceIn(220, 1_400)
+            extraction.pages.take(8).forEach { page ->
+                if (length < maxContextChars) {
+                    append("--- Page ").append(page.pageNumber).append(" ---\n")
+                    append(page.normalizedText.take(perPageBudget)).append("\n\n")
+                }
+            }
+        } else {
+            if (rankedPassages.isNotEmpty()) {
+                append("Most Relevant Excerpts:\n")
+                rankedPassages.take(6).forEach { passage ->
+                    if (length < maxContextChars) {
+                        val pageSuffix = if (totalPages > 1) " (p. ${passage.pageNumber})" else ""
+                        append("- ").append(passage.snippet.take(280)).append(pageSuffix).append('\n')
+                    }
+                }
+                append('\n')
+            }
+            val remaining = (maxContextChars - length).coerceAtLeast(0)
+            if (remaining > 250) {
+                val perPageBudget = (remaining / totalPages.coerceAtMost(4)).coerceAtLeast(180)
+                extraction.pages.take(4).forEach { page ->
+                    if (length < maxContextChars) {
+                        append("--- Page ").append(page.pageNumber).append(" ---\n")
+                        append(page.normalizedText.take(perPageBudget)).append('\n')
+                    }
+                }
+            }
+        }
+    }.take(maxContextChars)
+
+    val citationGuidance = if (totalPages <= 1) {
+        "This is a 1-page PDF — do NOT repeat [Page 1] on every bullet."
+    } else {
+        "Only add a short trailing page reference like (p. 2) when helpful — never spam [Page 1] at the start of every line."
+    }
+
+    val formattingGuidance = if (isSummary) {
+        """
+        Format your summary systematically with these clean sections (omit empty sections and never repeat the same fact twice):
+        Executive Summary — ${file.name}
+        1. OVERVIEW (Document purpose in 1–2 crisp sentences)
+        2. KEY DETAILS (Compact Label → Value items)
+        3. MAIN TAKEAWAYS (3–5 non-redundant bullet points)
+        4. NOTABLE NUMBERS & ACTION ITEMS (Key dates, amounts, deadlines, or flagged alerts)
+        """.trimIndent()
+    } else {
+        "Answer directly and systematically using clean bullet points and bold labels where helpful."
+    }
+
+    return """
+        You are a concise, systematic document analyst inside File Radar.
+        Answer using ONLY the document excerpts below. $citationGuidance
+        $formattingGuidance
+
+        $contextBody
+
+        User Question: $question
+    """.trimIndent()
 }
 
 /**
@@ -1057,21 +1177,24 @@ private fun synthesizeLocalGemmaResponse(
         val actionItems = extractActionItemsAndAnomalies(extraction, maxItems = 8)
         val keyValues = extractStructuredKeyValuePairs(extraction, maxPairs = 6)
         return buildString {
-            append("Action Items, Recommendations & Flagged Alerts — ${file.name} ($provenanceSummary):\n\n")
+            append("Action Items, Recommendations & Alerts — ${file.name}\n")
+            append("Scope: $provenanceSummary\n")
             if (actionItems.isNotEmpty()) {
+                append("\n1. ACTION ITEMS & FLAGGED ALERTS\n")
                 actionItems.forEach { (pageNum, item) ->
-                    append("• [Page $pageNum] $item\n")
+                    append("• $item${formatCleanPageSuffix(pageNum, totalPages)}\n")
                 }
             } else {
+                append("\n1. KEY STATEMENTS\n")
                 val salient = extractSalientSummarySentences(extraction, maxSentences = 4)
                 salient.forEach { (pageNum, sentence) ->
-                    append("• [Page $pageNum] $sentence\n")
+                    append("• $sentence${formatCleanPageSuffix(pageNum, totalPages)}\n")
                 }
             }
             if (keyValues.isNotEmpty()) {
-                append("\nStructured Fields & Reference Values:\n")
+                append("\n2. RELATED FIELDS & REFERENCE VALUES\n")
                 keyValues.forEach { (pageNum, pair) ->
-                    append("• [Page $pageNum] $pair\n")
+                    append("• $pair${formatCleanPageSuffix(pageNum, totalPages)}\n")
                 }
             }
         }.trim()
@@ -1081,24 +1204,30 @@ private fun synthesizeLocalGemmaResponse(
     if (isNumbersOrDatesQuery) {
         val quantFacts = extractQuantitativeFacts(extraction, maxFacts = 10)
         val keyValues = extractStructuredKeyValuePairs(extraction, maxPairs = 6)
+        val seenFingerprints = mutableSetOf<String>()
         return buildString {
-            append("Key Numbers, Dates & Totals in ${file.name} ($provenanceSummary):\n\n")
+            append("Key Numbers, Dates & Totals — ${file.name}\n")
+            append("Scope: $provenanceSummary\n")
             if (quantFacts.isNotEmpty()) {
+                append("\n1. EXTRACTED FIGURES, DATES & METRICS\n")
                 quantFacts.forEach { (pageNum, fact) ->
-                    append("• [Page $pageNum] $fact\n")
+                    seenFingerprints.add(summaryLineFingerprint(fact))
+                    append("• $fact${formatCleanPageSuffix(pageNum, totalPages)}\n")
                 }
             } else if (topPassages.isNotEmpty()) {
+                append("\n1. RELEVANT NUMERICAL EXCERPTS\n")
                 topPassages.forEach { match ->
-                    val secPrefix = match.sectionHeading?.let { "[$it] " }.orEmpty()
-                    append("• [Page ${match.pageNumber}] $secPrefix${match.snippet}\n")
+                    val secPrefix = match.sectionHeading?.let { "$it — " }.orEmpty()
+                    append("• $secPrefix${match.snippet}${formatCleanPageSuffix(match.pageNumber, totalPages)}\n")
                 }
             } else {
-                append("No explicit numerical totals, currency amounts, or dates were detected in the extracted text of ${file.name}.")
+                append("\nNo explicit numerical totals, currency amounts, or dates were detected in ${file.name}.")
             }
-            if (keyValues.isNotEmpty()) {
-                append("\nExtracted Key-Value Fields:\n")
-                keyValues.forEach { (pageNum, kv) ->
-                    append("• [Page $pageNum] $kv\n")
+            val uniqueKv = keyValues.filter { (_, kv) -> seenFingerprints.add(summaryLineFingerprint(kv)) }
+            if (uniqueKv.isNotEmpty()) {
+                append("\n2. STRUCTURED KEY-VALUE FIELDS\n")
+                uniqueKv.forEach { (pageNum, kv) ->
+                    append("• $kv${formatCleanPageSuffix(pageNum, totalPages)}\n")
                 }
             }
         }.trim()
@@ -1110,25 +1239,29 @@ private fun synthesizeLocalGemmaResponse(
         val salient = extractSalientSummarySentences(extraction, maxSentences = 6)
         val quantFacts = extractQuantitativeFacts(extraction, maxFacts = 5)
         val actionItems = extractActionItemsAndAnomalies(extraction, maxItems = 4)
+        val seenFingerprints = mutableSetOf<String>()
         return buildString {
             append("Main Findings & Values — ${file.name}\n")
-            append("• Document Category: $docCategory ($provenanceSummary)\n\n")
+            append("Document Type: $docCategory • $provenanceSummary\n")
             if (salient.isNotEmpty()) {
-                append("Core Findings:\n")
+                append("\n1. CORE FINDINGS\n")
                 salient.forEach { (pageNum, sentence) ->
-                    append("• [Page $pageNum] $sentence\n")
+                    seenFingerprints.add(summaryLineFingerprint(sentence))
+                    append("• $sentence${formatCleanPageSuffix(pageNum, totalPages)}\n")
                 }
             }
-            if (quantFacts.isNotEmpty()) {
-                append("\nKey Recorded Values & Metrics:\n")
-                quantFacts.forEach { (pageNum, fact) ->
-                    append("• [Page $pageNum] $fact\n")
+            val uniqueMetrics = quantFacts.filter { (_, fact) -> seenFingerprints.add(summaryLineFingerprint(fact)) }
+            if (uniqueMetrics.isNotEmpty()) {
+                append("\n2. KEY RECORDED VALUES & METRICS\n")
+                uniqueMetrics.forEach { (pageNum, fact) ->
+                    append("• $fact${formatCleanPageSuffix(pageNum, totalPages)}\n")
                 }
             }
-            if (actionItems.isNotEmpty()) {
-                append("\nConclusions, Alerts & Next Steps:\n")
-                actionItems.forEach { (pageNum, item) ->
-                    append("• [Page $pageNum] $item\n")
+            val uniqueAlerts = actionItems.filter { (_, item) -> seenFingerprints.add(summaryLineFingerprint(item)) }
+            if (uniqueAlerts.isNotEmpty()) {
+                append("\n3. CONCLUSIONS, ALERTS & NEXT STEPS\n")
+                uniqueAlerts.forEach { (pageNum, item) ->
+                    append("• $item${formatCleanPageSuffix(pageNum, totalPages)}\n")
                 }
             }
         }.trim()
@@ -1137,18 +1270,20 @@ private fun synthesizeLocalGemmaResponse(
     // 5. Page & Section Outline Mode
     if (isPageOutlineQuery) {
         return buildString {
-            append("Pages & Sections Outline — ${file.name} ($provenanceSummary):\n\n")
+            append("Pages & Sections Outline — ${file.name}\n")
+            append("Scope: $provenanceSummary\n\n")
             pages.forEach { page ->
                 val sourceTag = page.source.badgeLabel
                 val heading = extractPageHeadingOrTitle(page)
                 val digest = summarizeSinglePage(page)
-                append("• Page ${page.pageNumber} ($sourceTag) — $heading\n")
+                append("Page ${page.pageNumber} — $heading ($sourceTag)\n")
                 if (page.detectedSections.size > 1) {
-                    append("  Sections: ${page.detectedSections.joinToString(" • ")}\n")
+                    append("• Sections: ${page.detectedSections.joinToString(" • ")}\n")
                 }
                 if (digest.isNotBlank() && !digest.equals(heading, ignoreCase = true)) {
-                    append("  $digest\n")
+                    append("• $digest\n")
                 }
+                append('\n')
             }
         }.trim()
     }
@@ -1172,34 +1307,36 @@ private fun synthesizeLocalGemmaResponse(
                 append("\n\n")
             }
 
-            val sectionLabel = primary.sectionHeading?.let { " • Section: $it" }.orEmpty()
-            append("Direct Answer (Page ${primary.pageNumber} • ${primary.source.badgeLabel}$sectionLabel):\n")
+            val sectionLabel = primary.sectionHeading?.let { " • $it" }.orEmpty()
+            val pageHeaderTag = if (totalPages > 1) "Page ${primary.pageNumber} • " else ""
+            append("Direct Answer ($pageHeaderTag${primary.source.badgeLabel}$sectionLabel)\n")
             append(primary.snippet)
             if (!primary.snippet.endsWith('.') && !primary.snippet.endsWith('!') && !primary.snippet.endsWith('?')) {
                 append('.')
             }
 
             if (supporting.isNotEmpty()) {
-                append("\n\nRelated Findings Across Document (MMR Diverse):\n")
+                append("\n\n1. RELATED FINDINGS\n")
                 supporting.forEach { match ->
-                    val secTag = match.sectionHeading?.let { " [$it]" }.orEmpty()
-                    append("• [Page ${match.pageNumber}$secTag] ${match.snippet}\n")
+                    val secPrefix = match.sectionHeading?.let { "$it — " }.orEmpty()
+                    append("• $secPrefix${match.snippet}${formatCleanPageSuffix(match.pageNumber, totalPages)}\n")
                 }
             }
 
             if (matchingChunk != null && matchingChunk.text.length > primary.snippet.length + 40) {
-                append("\nSupporting Paragraph Context (Page ${matchingChunk.pageNumber}, Chunk #${matchingChunk.chunkIndex + 1}):\n")
+                val chunkPageTag = if (totalPages > 1) " (p. ${matchingChunk.pageNumber})" else ""
+                append("\n2. SUPPORTING CONTEXT$chunkPageTag\n")
                 append(matchingChunk.text.take(460))
             }
         }.trim()
     } else {
         val fallbackSummary = extractSalientSummarySentences(extraction, maxSentences = 3)
         buildString {
-            append("No exact phrase match for \"$question\" was found in ${file.name} ($provenanceSummary).\n\n")
+            append("No exact phrase match for \"$question\" was found in ${file.name} ($provenanceSummary).\n")
             if (fallbackSummary.isNotEmpty()) {
-                append("Closest Key Statements in Document:\n")
+                append("\n1. CLOSEST KEY STATEMENTS\n")
                 fallbackSummary.forEach { (pageNum, sentence) ->
-                    append("• [Page $pageNum] $sentence\n")
+                    append("• $sentence${formatCleanPageSuffix(pageNum, totalPages)}\n")
                 }
             }
         }.trim()
@@ -1207,8 +1344,55 @@ private fun synthesizeLocalGemmaResponse(
 }
 
 /**
- * Builds a structured, multi-section Executive Summary for any PDF document.
- * Shared by both the PDF Chat Summarizer and the 1-tap "Summarize PDF" card inside the PDF Reader.
+ * Formats an unobtrusive trailing page citation `(p. N)` ONLY for multi-page documents.
+ * For 1-page PDFs, returns an empty string so `[Page 1]` is never spammed on every bullet.
+ */
+private fun formatCleanPageSuffix(pageNumber: Int, totalPages: Int): String {
+    return if (totalPages > 1) " (p. $pageNumber)" else ""
+}
+
+/**
+ * Produces a normalized fingerprint for cross-section deduplication so the same fact/line
+ * is never repeated across Key Details, Highlights, Metrics, and Alerts.
+ */
+private fun summaryLineFingerprint(text: String): String {
+    return text.lowercase(Locale.ROOT)
+        .replace("→", " ")
+        .replace(Regex("[^a-z0-9]+"), " ")
+        .trim()
+        .take(56)
+}
+
+/**
+ * Interleaves per-page candidate lists in round-robin order (Page 1, Page 2, Page 3, ...)
+ * so multi-page PDFs always get balanced document-wide coverage instead of filling exclusively from Page 1.
+ */
+private fun <T> interleaveRoundRobinByPage(
+    perPageBuckets: List<List<T>>,
+    maxTotal: Int
+): List<T> {
+    if (perPageBuckets.isEmpty() || maxTotal <= 0) return emptyList()
+    val result = mutableListOf<T>()
+    val iterators = perPageBuckets.map { it.iterator() }
+    var madeProgress = true
+    while (result.size < maxTotal && madeProgress) {
+        madeProgress = false
+        for (it in iterators) {
+            if (it.hasNext()) {
+                result.add(it.next())
+                madeProgress = true
+                if (result.size >= maxTotal) break
+            }
+        }
+    }
+    return result
+}
+
+/**
+ * Builds a clean, systematic, non-redundant Executive Summary for any PDF document.
+ * - Eliminates `[Page 1]` noise on 1-page PDFs and uses subtle trailing `(p. N)` only on multi-page PDFs.
+ * - Samples round-robin across ALL pages of multi-page PDFs so later pages are never starved.
+ * - Deduplicates entries across sections so each section adds genuinely distinct value.
  */
 internal fun buildStructuredExecutiveSummary(
     fileName: String,
@@ -1223,11 +1407,11 @@ internal fun buildStructuredExecutiveSummary(
     val digitalPageCount = pages.count { it.source == ExtractionSource.PDF_TEXT }
     val resolvedProvenance = provenanceSummary ?: when {
         ocrPageCount > 0 && digitalPageCount > 0 ->
-            "$totalPages pages ($digitalPageCount digital text + $ocrPageCount Visual/Fused OCR)"
+            "$totalPages pages ($digitalPageCount digital + $ocrPageCount Visual/Fused OCR)"
         ocrPageCount > 0 ->
-            "$totalPages ${if (totalPages == 1) "page" else "pages"} (Visual OCR via ML Kit)"
+            "$totalPages ${if (totalPages == 1) "page" else "pages"} (Visual OCR)"
         else ->
-            "$totalPages ${if (totalPages == 1) "page" else "pages"} (Digital Text via PDFBox)"
+            "$totalPages ${if (totalPages == 1) "page" else "pages"} (Digital Text)"
     }
 
     val fullDocumentText = pages.joinToString("\n\n") { it.normalizedText }
@@ -1237,73 +1421,94 @@ internal fun buildStructuredExecutiveSummary(
 
     val docCategory = classifyDocumentCategory(fileName, extraction)
     val topTopics = extractTopDocumentKeyphrases(extraction, limit = 7)
-    val salientSentences = extractSalientSummarySentences(extraction, maxSentences = 5)
-    val keyValuePairs = extractStructuredKeyValuePairs(extraction, maxPairs = 6)
-    val keyMetrics = extractQuantitativeFacts(extraction, maxFacts = 6)
-    val actionItems = extractActionItemsAndAnomalies(extraction, maxItems = 5)
     val allSections = pages.flatMap { it.detectedSections }.distinct().take(8)
 
-    val thesisLine = salientSentences.firstOrNull()?.second
+    // Extract balanced, document-wide candidates
+    val rawKeyValues = extractStructuredKeyValuePairs(extraction, maxPairs = 6)
+    val rawSalient = extractSalientSummarySentences(extraction, maxSentences = 6)
+    val rawMetrics = extractQuantitativeFacts(extraction, maxFacts = 7)
+    val rawActions = extractActionItemsAndAnomalies(extraction, maxItems = 5)
+
+    // Cross-section deduplication tracker so the same line is never echoed in multiple sections
+    val displayedFingerprints = mutableSetOf<String>()
+
+    val thesisLine = rawSalient.firstOrNull()?.second
         ?: pages.firstOrNull()?.let { summarizeSinglePage(it) }
-        ?: "Structured document containing ${posSummary.totalWords} words across $totalPages pages."
+        ?: "Structured document containing ${posSummary.totalWords} words across $totalPages ${if (totalPages == 1) "page" else "pages"}."
+    displayedFingerprints.add(summaryLineFingerprint(thesisLine))
+
+    val uniqueKeyValues = rawKeyValues.filter { (_, kv) ->
+        displayedFingerprints.add(summaryLineFingerprint(kv))
+    }
+    val uniqueSalient = rawSalient.filter { (_, sentence) ->
+        displayedFingerprints.add(summaryLineFingerprint(sentence))
+    }.take(5)
+    val uniqueMetrics = rawMetrics.filter { (_, metric) ->
+        displayedFingerprints.add(summaryLineFingerprint(metric))
+    }.take(5)
+    val uniqueActions = rawActions.filter { (_, action) ->
+        displayedFingerprints.add(summaryLineFingerprint(action))
+    }.take(4)
+
+    var sectionIndex = 1
+    fun nextSectionTitle(title: String): String = "\n${sectionIndex++}. $title\n"
 
     return buildString {
         append("Executive Summary — $fileName\n")
-        append("• Document Type: $docCategory\n")
-        append("• Core Purpose: $thesisLine\n")
-        append("• Scope & Provenance: $resolvedProvenance • ${posSummary.totalWords} words ($readingTimeLabel) • ${extraction.chunks.size} indexed chunks")
-        if (extraction.removedRunningHeadersCount > 0) {
-            append(" (${extraction.removedRunningHeadersCount} repeated headers/footers stripped)")
-        }
-        append('\n')
+        append("Document Type: $docCategory\n")
+        append("Length: $resolvedProvenance • ${posSummary.totalWords} words ($readingTimeLabel)\n")
+        append("Core Purpose: $thesisLine\n")
         if (allSections.isNotEmpty()) {
-            append("• Detected Sections: ${allSections.joinToString(" • ")}\n")
+            append("Sections: ${allSections.joinToString(" • ")}\n")
         }
         if (topTopics.isNotEmpty()) {
-            append("• Key Concepts & Entities: ${topTopics.joinToString(", ")}\n")
+            append("Key Topics: ${topTopics.joinToString(", ")}\n")
         }
 
-        if (keyValuePairs.isNotEmpty()) {
-            append("\n1. Structured Fields & Identifiers:\n")
-            keyValuePairs.forEach { (pageNum, kv) ->
-                append("• [Page $pageNum] $kv\n")
+        if (uniqueKeyValues.isNotEmpty()) {
+            append(nextSectionTitle("KEY DETAILS & IDENTIFIERS"))
+            uniqueKeyValues.forEach { (pageNum, kv) ->
+                append("• $kv${formatCleanPageSuffix(pageNum, totalPages)}\n")
             }
         }
 
-        if (salientSentences.isNotEmpty()) {
-            append("\n2. Key Highlights & Main Findings:\n")
-            salientSentences.forEach { (pageNum, sentence) ->
-                append("• [Page $pageNum] $sentence\n")
+        if (uniqueSalient.isNotEmpty()) {
+            append(nextSectionTitle("EXECUTIVE TAKEAWAYS"))
+            uniqueSalient.forEach { (pageNum, sentence) ->
+                append("• $sentence${formatCleanPageSuffix(pageNum, totalPages)}\n")
             }
         }
 
-        if (keyMetrics.isNotEmpty()) {
-            append("\n3. Notable Numbers, Dates, Tables & Measurements:\n")
-            keyMetrics.forEach { (pageNum, fact) ->
-                append("• [Page $pageNum] $fact\n")
+        if (uniqueMetrics.isNotEmpty()) {
+            append(nextSectionTitle("NOTABLE METRICS, DATES & TABLES"))
+            uniqueMetrics.forEach { (pageNum, fact) ->
+                append("• $fact${formatCleanPageSuffix(pageNum, totalPages)}\n")
             }
         }
 
-        if (actionItems.isNotEmpty()) {
-            append("\n4. Action Items, Recommendations & Flagged Alerts:\n")
-            actionItems.forEach { (pageNum, item) ->
-                append("• [Page $pageNum] $item\n")
+        if (uniqueActions.isNotEmpty()) {
+            append(nextSectionTitle("ACTION ITEMS, RECOMMENDATIONS & ALERTS"))
+            uniqueActions.forEach { (pageNum, item) ->
+                append("• $item${formatCleanPageSuffix(pageNum, totalPages)}\n")
             }
         }
 
-        append("\n5. Page-by-Page Breakdown:\n")
-        pages.take(10).forEach { page ->
-            val heading = extractPageHeadingOrTitle(page)
-            val pageDigest = summarizeSinglePage(page)
-            val badge = when (page.source) {
-                ExtractionSource.ML_KIT_OCR -> " [Visual OCR]"
-                ExtractionSource.FUSED_HYBRID_OCR -> " [Hybrid Fused]"
-                else -> ""
-            }
-            if (!pageDigest.equals(heading, ignoreCase = true) && !pageDigest.startsWith(heading, ignoreCase = true)) {
-                append("• Page ${page.pageNumber}$badge ($heading): $pageDigest\n")
-            } else {
-                append("• Page ${page.pageNumber}$badge: $pageDigest\n")
+        // Only render a Page-by-Page Breakdown when the PDF actually has multiple pages
+        if (pages.size > 1) {
+            append(nextSectionTitle("PAGE-BY-PAGE OUTLINE"))
+            pages.take(10).forEach { page ->
+                val heading = extractPageHeadingOrTitle(page)
+                val pageDigest = summarizeSinglePage(page)
+                val badge = when (page.source) {
+                    ExtractionSource.ML_KIT_OCR -> " [Visual OCR]"
+                    ExtractionSource.FUSED_HYBRID_OCR -> " [Hybrid Fused]"
+                    else -> ""
+                }
+                if (!pageDigest.equals(heading, ignoreCase = true) && !pageDigest.startsWith(heading, ignoreCase = true)) {
+                    append("• Page ${page.pageNumber}$badge — $heading: $pageDigest\n")
+                } else {
+                    append("• Page ${page.pageNumber}$badge — $pageDigest\n")
+                }
             }
         }
 
@@ -1311,9 +1516,9 @@ internal fun buildStructuredExecutiveSummary(
             val probPct = String.format(Locale.US, "%.1f%%", posSummary.probabilityOfFiction * 100.0)
             val radjpronStr = String.format(Locale.US, "%.3f", posSummary.rAdjPron)
             val radvadjStr = String.format(Locale.US, "%.3f", posSummary.rAdvAdj)
-            append("\n6. Linguistic & Genre Profile:\n")
-            append("• Classification: ${posSummary.predictedGenreLabel} (Probability of Fiction = $probPct, RADJPRON = $radjpronStr, RADVADJ = $radvadjStr)\n")
-            append("• POS Breakdown: ${posSummary.nounCount} Nouns • ${posSummary.verbCount} Verbs • ${posSummary.adjectiveCount} Adjectives • ${posSummary.adverbCount} Adverbs • ${posSummary.pronounCount} Pronouns")
+            append(nextSectionTitle("LINGUISTIC & GENRE PROFILE"))
+            append("• Genre Prediction: ${posSummary.predictedGenreLabel} (Probability of Fiction = $probPct, RADJPRON = $radjpronStr, RADVADJ = $radvadjStr)\n")
+            append("• POS Distribution: ${posSummary.nounCount} Nouns • ${posSummary.verbCount} Verbs • ${posSummary.adjectiveCount} Adjectives • ${posSummary.adverbCount} Adverbs • ${posSummary.pronounCount} Pronouns")
         }
     }.trim()
 }
@@ -1347,17 +1552,18 @@ internal fun classifyDocumentCategory(
 }
 
 /**
- * Extracts structured `Key: Value` or `Column 1 → Column 2` fields (e.g., Patient Name, Invoice #,
- * Account ID, Date, Status, Total Amount) across all pages.
+ * Extracts structured `Key → Value` fields across ALL pages using round-robin balancing
+ * so multi-page PDFs surface key details from every page instead of only Page 1.
  */
 internal fun extractStructuredKeyValuePairs(
     extraction: DocumentExtractionResult,
     maxPairs: Int
 ): List<Pair<Int, String>> {
-    val pairs = mutableListOf<Pair<Int, String>>()
     val seenKeys = mutableSetOf<String>()
+    val perPageBuckets = mutableListOf<List<Pair<Int, String>>>()
 
     for (page in extraction.pages) {
+        val pageItems = mutableListOf<Pair<Int, String>>()
         for (rawLine in page.normalizedText.lines()) {
             val line = rawLine.trim().trimStart('•', '-', '*').trim()
             if (line.length !in 6..140 || isBoilerplateMetadataLine(line)) continue
@@ -1371,8 +1577,7 @@ internal fun extractStructuredKeyValuePairs(
                 if (keyWords in 1..5 && value.length in 1..85 && key.any { it.isLetter() }) {
                     val normKey = key.lowercase(Locale.ROOT)
                     if (seenKeys.add(normKey)) {
-                        pairs.add(page.pageNumber to "$key → $value")
-                        if (pairs.size >= maxPairs) return pairs
+                        pageItems.add(page.pageNumber to "$key → $value")
                     }
                 }
             } else if (line.contains(" | ")) {
@@ -1382,32 +1587,35 @@ internal fun extractStructuredKeyValuePairs(
                     val normKey = cells[0].lowercase(Locale.ROOT)
                     if (seenKeys.add(normKey)) {
                         val formatted = "${cells[0]} → ${cells.drop(1).joinToString(" | ")}"
-                        pairs.add(page.pageNumber to formatted)
-                        if (pairs.size >= maxPairs) return pairs
+                        pageItems.add(page.pageNumber to formatted)
                     }
                 }
             }
         }
+        if (pageItems.isNotEmpty()) {
+            perPageBuckets.add(pageItems)
+        }
     }
-    return pairs
+    return interleaveRoundRobinByPage(perPageBuckets, maxPairs)
 }
 
 /**
  * Extracts actionable items, recommendations, deadlines, conclusions, and flagged anomalies
- * (e.g., out-of-range lab values, overdue balances, required follow-ups, or key conclusions).
+ * balanced round-robin across ALL pages.
  */
 internal fun extractActionItemsAndAnomalies(
     extraction: DocumentExtractionResult,
     maxItems: Int
 ): List<Pair<Int, String>> {
-    val results = mutableListOf<Pair<Int, String>>()
     val seen = mutableSetOf<String>()
+    val perPageBuckets = mutableListOf<List<Pair<Int, String>>>()
     val actionOrAlertRegex = Regex(
         "\\b(recommend\\w*|action\\w*|follow[- ]?up|advise\\w*|must|required|deadline|due\\s+date|due\\s+by|urgent|warning|note:|important|conclusion\\w*|borderline|elevated|high|low|abnormal|deficit|insufficient|exceed\\w*|re-check|consult|schedule|pay\\s+by)\\b",
         RegexOption.IGNORE_CASE
     )
 
     for (page in extraction.pages) {
+        val pageItems = mutableListOf<Pair<Int, String>>()
         val sentences = TextChunker.splitIntoSentences(page.normalizedText)
             .flatMap { block ->
                 if (block.contains('\n')) block.lines().map { it.trim() } else listOf(block.trim())
@@ -1419,13 +1627,15 @@ internal fun extractActionItemsAndAnomalies(
             if (actionOrAlertRegex.containsMatchIn(sentence)) {
                 val key = sentence.lowercase(Locale.ROOT).take(60)
                 if (seen.add(key)) {
-                    results.add(page.pageNumber to sentence)
-                    if (results.size >= maxItems) return results
+                    pageItems.add(page.pageNumber to sentence)
                 }
             }
         }
+        if (pageItems.isNotEmpty()) {
+            perPageBuckets.add(pageItems)
+        }
     }
-    return results
+    return interleaveRoundRobinByPage(perPageBuckets, maxItems)
 }
 
 /**
@@ -1456,9 +1666,8 @@ private fun extractTopDocumentKeyphrases(
 }
 
 /**
- * Extractive TextRank / Centroid sentence selector with MMR-style trigram deduplication (< 0.45)
- * that chooses the most informative, high-centrality sentences across the PDF while skipping
- * headers, footers, and metadata boilerplate.
+ * Extractive TextRank / Centroid sentence selector with MMR-style trigram deduplication (< 0.52)
+ * and multi-page diversity so sentences are balanced across pages rather than clustered on Page 1.
  */
 private fun extractSalientSummarySentences(
     extraction: DocumentExtractionResult,
@@ -1511,10 +1720,19 @@ private fun extractSalientSummarySentences(
         Triple(pageNum, sentence, centroidScore * hasDigits * penalty)
     }
 
+    // Group scored sentences by page and interleave top candidates per page for balanced coverage
+    val byPageSorted = scored
+        .groupBy { it.first }
+        .toSortedMap()
+        .values
+        .map { list -> list.sortedByDescending { it.third } }
+
+    val interleavedCandidates = interleaveRoundRobinByPage(byPageSorted, maxTotal = maxSentences * 4)
+
     val selected = mutableListOf<Pair<Int, String>>()
     val selectedTrigrams = mutableListOf<Set<String>>()
 
-    for ((pageNum, sentence, _) in scored.sortedByDescending { it.third }) {
+    for ((pageNum, sentence, _) in interleavedCandidates) {
         val candTrigrams = extractCharTrigrams(sentence)
         val tooSimilar = selectedTrigrams.any { existing ->
             computeTrigramCosineSimilarity(candTrigrams, existing) > 0.52
@@ -1531,20 +1749,21 @@ private fun extractSalientSummarySentences(
 
 /**
  * Extracts quantitative lines/sentences containing currency figures, percentages, dates,
- * reference ranges, or key-value/table metrics across all pages.
+ * reference ranges, or key-value/table metrics balanced round-robin across ALL pages.
  */
 private fun extractQuantitativeFacts(
     extraction: DocumentExtractionResult,
     maxFacts: Int
 ): List<Pair<Int, String>> {
-    val facts = mutableListOf<Pair<Int, String>>()
     val seen = mutableSetOf<String>()
+    val perPageBuckets = mutableListOf<List<Pair<Int, String>>>()
     val metricRegex = Regex(
         "(\\$[0-9,]+(\\.[0-9]{2})?|\\b\\d+(\\.\\d+)?\\s*(%|mg/dL|g/dL|mIU/L|U/L|uL|ng/mL|mL/min|MB|GB|KB|days|months|years|USD|EUR|INR)\\b|\\b\\d{1,2}[/-]\\d{1,2}[/-]\\d{2,4}\\b|\\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\\s+\\d{1,2}\\b)",
         RegexOption.IGNORE_CASE
     )
 
     for (page in extraction.pages) {
+        val pageFacts = mutableListOf<Pair<Int, String>>()
         val lines = page.normalizedText
             .lines()
             .map { it.trim().trimStart('•', '-', '*').trim() }
@@ -1555,13 +1774,15 @@ private fun extractQuantitativeFacts(
             if (metricRegex.containsMatchIn(line) || isMetricTableLine || (line.contains(':') && line.any { it.isDigit() })) {
                 val key = line.lowercase(Locale.ROOT)
                 if (seen.add(key)) {
-                    facts.add(page.pageNumber to line)
-                    if (facts.size >= maxFacts) return facts
+                    pageFacts.add(page.pageNumber to line)
                 }
             }
         }
+        if (pageFacts.isNotEmpty()) {
+            perPageBuckets.add(pageFacts)
+        }
     }
-    return facts
+    return interleaveRoundRobinByPage(perPageBuckets, maxFacts)
 }
 
 private fun extractPageHeadingOrTitle(page: ExtractedPage): String {
@@ -1677,11 +1898,11 @@ fun FullScreenPdfChatDialog(
         isIndexingPdf = false
     }
 
-    val sendQuestion: (String) -> Unit = { rawQuestion ->
+    val sendQuestionWithEngine: (String, PdfChatEngineOption) -> Unit = { rawQuestion, activeEngine ->
         val trimmed = rawQuestion.trim()
         if (trimmed.isNotEmpty() && !isGeneratingReply) {
             focusManager.clearFocus()
-            val activeEngine = selectedEngine
+            selectedEngine = activeEngine
             val now = System.currentTimeMillis()
             val userMessage = PdfChatMessage(
                 id = "user_$now",
@@ -1695,9 +1916,9 @@ fun FullScreenPdfChatDialog(
                 isUser = false,
                 engine = activeEngine,
                 text = if (activeEngine == PdfChatEngineOption.LOCAL_GEMMA_E2B) {
-                    "Running Local Gemma E2B RAG & Structured Synthesizer over PDF chunks…"
+                    "Synthesizing structured on-device summary & RAG answer…"
                 } else {
-                    "Connecting to Gemini 3.8 Flash (Keyless Free Tier) and analyzing PDF chunks…"
+                    "Streaming via ultra-fast Gemini 3.5 Flash-Lite (compact RAG context)…"
                 },
                 isStreaming = true
             )
@@ -1759,6 +1980,10 @@ fun FullScreenPdfChatDialog(
                 runCatching { listState.animateScrollToItem(answerItemIndex) }
             }
         }
+    }
+
+    val sendQuestion: (String) -> Unit = { rawQuestion ->
+        sendQuestionWithEngine(rawQuestion, selectedEngine)
     }
 
     Dialog(
@@ -2030,9 +2255,9 @@ fun FullScreenPdfChatDialog(
                                                 placeholder = {
                                                     Text(
                                                         text = if (selectedEngine == PdfChatEngineOption.LOCAL_GEMMA_E2B) {
-                                                            "Type a question for Local Gemma E2B…"
+                                                            "Ask Local Gemma E2B (instant offline)…"
                                                         } else {
-                                                            "Type a question for Gemini 3.8 Flash…"
+                                                            "Ask Gemini 3.5 Flash-Lite (ultra-fast cloud)…"
                                                         },
                                                         maxLines = 1,
                                                         overflow = TextOverflow.Ellipsis
@@ -2151,7 +2376,15 @@ fun FullScreenPdfChatDialog(
                                 items = messages,
                                 key = { it.id }
                             ) { msg ->
-                                PdfChatBubble(message = msg)
+                                PdfChatBubble(
+                                    message = msg,
+                                    onRetryCloud = { q ->
+                                        sendQuestionWithEngine(q, PdfChatEngineOption.GEMINI_SUBSCRIPTION)
+                                    },
+                                    onAnswerOffline = { q ->
+                                        sendQuestionWithEngine(q, PdfChatEngineOption.LOCAL_GEMMA_E2B)
+                                    }
+                                )
                             }
                         }
                     }
@@ -2232,7 +2465,11 @@ private fun PdfEngineOptionCard(
 }
 
 @Composable
-private fun PdfChatBubble(message: PdfChatMessage) {
+private fun PdfChatBubble(
+    message: PdfChatMessage,
+    onRetryCloud: ((String) -> Unit)? = null,
+    onAnswerOffline: ((String) -> Unit)? = null
+) {
     val alignment = if (message.isUser) Alignment.End else Alignment.Start
     val bubbleColor = when {
         message.isUser -> MaterialTheme.colorScheme.primary
@@ -2245,6 +2482,12 @@ private fun PdfChatBubble(message: PdfChatMessage) {
         message.isError -> MaterialTheme.colorScheme.onErrorContainer
         message.engine == PdfChatEngineOption.GEMINI_SUBSCRIPTION -> MaterialTheme.colorScheme.onSecondaryContainer
         else -> MaterialTheme.colorScheme.onSurface
+    }
+    val accentColor = when {
+        message.isUser -> MaterialTheme.colorScheme.onPrimary
+        message.isError -> MaterialTheme.colorScheme.error
+        message.engine == PdfChatEngineOption.GEMINI_SUBSCRIPTION -> MaterialTheme.colorScheme.secondary
+        else -> MaterialTheme.colorScheme.primary
     }
 
     Column(
@@ -2302,13 +2545,71 @@ private fun PdfChatBubble(message: PdfChatMessage) {
                     )
                 }
 
-                Text(
-                    text = message.text,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = textColor,
-                    softWrap = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
+                if (message.isUser || message.isError || message.isStreaming) {
+                    Text(
+                        text = message.text,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = textColor,
+                        softWrap = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                } else {
+                    SystematicDocumentText(
+                        text = message.text,
+                        textColor = textColor,
+                        accentColor = accentColor
+                    )
+                }
+
+                // 1-tap Recovery Actions when a Cloud Gemini request fails or times out
+                if (message.isError && !message.retryQuestion.isNullOrBlank()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (onAnswerOffline != null) {
+                            Button(
+                                onClick = { onAnswerOffline(message.retryQuestion) },
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                                modifier = Modifier.testTag("pdf_chat_fallback_offline_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Memory,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(15.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "Answer Offline (Gemma E2B)",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                        if (onRetryCloud != null) {
+                            OutlinedButton(
+                                onClick = { onRetryCloud(message.retryQuestion) },
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                                modifier = Modifier.testTag("pdf_chat_retry_cloud_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Refresh,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(15.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "Retry Flash-Lite",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                        }
+                    }
+                }
 
                 if (message.pageCitations.isNotEmpty()) {
                     Row(
@@ -2340,6 +2641,188 @@ private fun PdfChatBubble(message: PdfChatMessage) {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+private val numberedSectionHeadingRegex = Regex("^\\d+\\.\\s+[A-Z0-9 &/,\\-–—()]+$")
+private val markdownHeadingRegex = Regex("^#{1,3}\\s+(.+)$")
+
+/**
+ * Systematic, visually structured renderer for PDF Summaries and AI answers.
+ * Styles section headers with accent badges/typography, bolds `Key → Value` and `Label: Value` keys,
+ * cleans markdown `**bold**` markers into real bold spans, and aligns bulleted lists cleanly.
+ */
+@Composable
+internal fun SystematicDocumentText(
+    text: String,
+    textColor: Color,
+    accentColor: Color,
+    baseFontSizeSp: Float = 14f,
+    modifier: Modifier = Modifier
+) {
+    val lines = remember(text) { text.lines() }
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        lines.forEachIndexed { idx, rawLine ->
+            val trimmed = rawLine.trim()
+            if (trimmed.isEmpty()) {
+                Spacer(modifier = Modifier.height(4.dp))
+                return@forEachIndexed
+            }
+
+            val mdMatch = markdownHeadingRegex.matchEntire(trimmed)
+            val isMainTitle = idx == 0 && (
+                trimmed.startsWith("Executive Summary") ||
+                    trimmed.startsWith("Direct Answer") ||
+                    trimmed.startsWith("Action Items") ||
+                    trimmed.startsWith("Key Numbers") ||
+                    trimmed.startsWith("Main Findings") ||
+                    trimmed.startsWith("Pages & Sections")
+                )
+            val isNumberedSection = numberedSectionHeadingRegex.matches(trimmed)
+
+            when {
+                isMainTitle -> {
+                    Text(
+                        text = parseMarkdownBold(trimmed, textColor),
+                        fontSize = (baseFontSizeSp + 1.5f).sp,
+                        lineHeight = ((baseFontSizeSp + 1.5f) * 1.35f).sp,
+                        fontWeight = FontWeight.Bold,
+                        color = textColor,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    HorizontalDivider(
+                        color = accentColor.copy(alpha = 0.28f),
+                        modifier = Modifier.padding(vertical = 2.dp)
+                    )
+                }
+                mdMatch != null || isNumberedSection -> {
+                    val headingLabel = mdMatch?.groupValues?.getOrNull(1)?.trim() ?: trimmed
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = headingLabel.replace("**", ""),
+                        fontSize = (baseFontSizeSp - 1.5f).coerceAtLeast(11.5f).sp,
+                        lineHeight = ((baseFontSizeSp - 1.5f).coerceAtLeast(11.5f) * 1.3f).sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        letterSpacing = 0.4.sp,
+                        color = accentColor,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                trimmed.startsWith("• ") || trimmed.startsWith("- ") || trimmed.startsWith("* ") -> {
+                    val bulletBody = trimmed.drop(2).trim()
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.Top
+                    ) {
+                        Text(
+                            text = "•",
+                            fontSize = baseFontSizeSp.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = accentColor
+                        )
+                        Text(
+                            text = formatStructuredLineSpan(bulletBody, textColor, accentColor),
+                            fontSize = baseFontSizeSp.sp,
+                            lineHeight = (baseFontSizeSp * 1.42f).sp,
+                            color = textColor,
+                            softWrap = true,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+                else -> {
+                    Text(
+                        text = formatStructuredLineSpan(trimmed, textColor, accentColor),
+                        fontSize = baseFontSizeSp.sp,
+                        lineHeight = (baseFontSizeSp * 1.42f).sp,
+                        color = textColor,
+                        softWrap = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun formatStructuredLineSpan(
+    line: String,
+    textColor: Color,
+    accentColor: Color
+): AnnotatedString {
+    // Highlight "Field → Value" pairs cleanly
+    val arrowIdx = line.indexOf(" → ")
+    if (arrowIdx in 2..48) {
+        val label = line.substring(0, arrowIdx).replace("**", "")
+        val value = line.substring(arrowIdx + 3)
+        return buildAnnotatedString {
+            withStyle(SpanStyle(fontWeight = FontWeight.SemiBold, color = textColor)) {
+                append(label)
+            }
+            withStyle(SpanStyle(fontWeight = FontWeight.Bold, color = accentColor)) {
+                append("  →  ")
+            }
+            append(parseMarkdownBold(value, textColor))
+        }
+    }
+
+    // Highlight short metadata "Label: Value" prefixes
+    val colonIdx = line.indexOf(": ")
+    if (colonIdx in 2..32 && !line.startsWith("http", ignoreCase = true)) {
+        val label = line.substring(0, colonIdx).replace("**", "")
+        val value = line.substring(colonIdx + 2)
+        if (label.split(' ').size <= 4) {
+            return buildAnnotatedString {
+                withStyle(SpanStyle(fontWeight = FontWeight.SemiBold, color = textColor)) {
+                    append(label)
+                    append(": ")
+                }
+                append(parseMarkdownBold(value, textColor))
+            }
+        }
+    }
+
+    return parseMarkdownBold(line, textColor)
+}
+
+private fun parseMarkdownBold(input: String, textColor: Color): AnnotatedString {
+    val pageTagRegex = Regex("\\(p\\. \\d+\\)$")
+    val pageTagMatch = pageTagRegex.find(input)
+    val mainText = if (pageTagMatch != null) input.substring(0, pageTagMatch.range.first) else input
+    val trailingPageTag = pageTagMatch?.value
+
+    return buildAnnotatedString {
+        var cursor = 0
+        val boldRegex = Regex("\\*\\*(.+?)\\*\\*")
+        for (match in boldRegex.findAll(mainText)) {
+            if (match.range.first > cursor) {
+                append(mainText.substring(cursor, match.range.first))
+            }
+            withStyle(SpanStyle(fontWeight = FontWeight.Bold, color = textColor)) {
+                append(match.groupValues[1])
+            }
+            cursor = match.range.last + 1
+        }
+        if (cursor < mainText.length) {
+            append(mainText.substring(cursor))
+        }
+        if (trailingPageTag != null) {
+            withStyle(
+                SpanStyle(
+                    fontWeight = FontWeight.Medium,
+                    color = textColor.copy(alpha = 0.6f),
+                    fontFamily = FontFamily.Monospace
+                )
+            ) {
+                append(trailingPageTag)
             }
         }
     }

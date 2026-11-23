@@ -625,11 +625,11 @@ fun FullScreenPdfReaderDialog(
                                                     }
                                                 }
                                                 HorizontalDivider(color = Color(0xFFA7F3D0))
-                                                Text(
+                                                SystematicDocumentText(
                                                     text = executiveSummaryText,
-                                                    fontSize = (textFontSizeSp - 1f).coerceAtLeast(12f).sp,
-                                                    lineHeight = ((textFontSizeSp - 1f).coerceAtLeast(12f) * 1.42f).sp,
-                                                    color = Color(0xFF064E3B)
+                                                    textColor = Color(0xFF064E3B),
+                                                    accentColor = Color(0xFF047857),
+                                                    baseFontSizeSp = (textFontSizeSp - 1f).coerceAtLeast(12f)
                                                 )
                                             }
                                         }

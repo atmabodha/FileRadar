@@ -570,12 +570,113 @@ class ExampleRobolectricTest {
             extraction = extractionResult
         )
         assertTrue(summary.contains("Document Type: Medical / Clinical Lab Report"))
-        assertTrue(summary.contains("1. Structured Fields & Identifiers:"))
+        assertTrue(summary.contains("KEY DETAILS & IDENTIFIERS"))
         assertTrue(summary.contains("Patient Name → Arjun Mehta"))
-        assertTrue(summary.contains("4. Action Items, Recommendations & Flagged Alerts:"))
+        assertTrue(summary.contains("ACTION ITEMS, RECOMMENDATIONS & ALERTS"))
         assertTrue(summary.contains("follow-up"))
-        assertTrue(summary.contains("6. Linguistic & Genre Profile:"))
+        assertTrue(summary.contains("LINGUISTIC & GENRE PROFILE"))
         assertTrue(summary.contains("Probability of Fiction"))
+        // Single-page PDFs must NEVER spam [Page 1] or (p. 1) on summary lines
+        assertFalse(summary.contains("[Page 1]"))
+        assertFalse(summary.contains("(p. 1)"))
+    }
+
+    @Test
+    fun multiPagePdfSummary_balancesAllPagesWithoutPage1Spam_andCompactCloudPromptStaysBounded() {
+        val uri = Uri.parse("file:///storage/emulated/0/Download/Quarterly_Operations_2026.pdf")
+        val page1Text = """
+            1. EXECUTIVE OVERVIEW
+            Client Name: Horizon Energy Systems
+            Quarter: Q1 2026
+            Revenue rose 18% year-over-year to $4.2M driven by solar storage deployments across three regions.
+        """.trimIndent()
+        val page2Text = """
+            2. INFRASTRUCTURE & COST METRICS
+            Operating Margin: 24.5%
+            Cloud Latency: 142 ms
+            Engineering reduced inference cost per 1,000 requests by 37% after migrating to lightweight quantization.
+        """.trimIndent()
+        val page3Text = """
+            3. RISKS & ACTION PLAN
+            Compliance Officer: Priya Nair
+            Deadline: April 30, 2026
+            Action Required: Complete regional grid safety audit before May 15, 2026 to avoid deployment delays.
+        """.trimIndent()
+
+        val pages = listOf(
+            com.example.pdfextractor.model.ExtractedPage(
+                pageNumber = 1,
+                rawText = page1Text,
+                normalizedText = com.example.pdfextractor.TextNormalizer.normalize(page1Text),
+                source = ExtractionSource.PDF_TEXT,
+                detectedSections = listOf("1. EXECUTIVE OVERVIEW")
+            ),
+            com.example.pdfextractor.model.ExtractedPage(
+                pageNumber = 2,
+                rawText = page2Text,
+                normalizedText = com.example.pdfextractor.TextNormalizer.normalize(page2Text),
+                source = ExtractionSource.PDF_TEXT,
+                detectedSections = listOf("2. INFRASTRUCTURE & COST METRICS")
+            ),
+            com.example.pdfextractor.model.ExtractedPage(
+                pageNumber = 3,
+                rawText = page3Text,
+                normalizedText = com.example.pdfextractor.TextNormalizer.normalize(page3Text),
+                source = ExtractionSource.PDF_TEXT,
+                detectedSections = listOf("3. RISKS & ACTION PLAN")
+            )
+        )
+        val extractionResult = com.example.pdfextractor.model.DocumentExtractionResult(
+            documentUri = uri,
+            totalPages = 3,
+            pages = pages,
+            chunks = com.example.pdfextractor.TextChunker.chunkPages(uri, pages),
+            removedRunningHeadersCount = 0
+        )
+
+        val multiSummary = com.example.ui.components.buildStructuredExecutiveSummary(
+            fileName = "Quarterly_Operations_2026.pdf",
+            extraction = extractionResult
+        )
+        // Must NEVER use repetitive [Page 1] prefixes
+        assertFalse(multiSummary.contains("[Page 1]"))
+        assertFalse(multiSummary.contains("[Page 2]"))
+        // Must sample across ALL pages (round-robin) and emit clean trailing (p. 2) / (p. 3) citations
+        assertTrue(multiSummary.contains("Horizon Energy Systems"))
+        assertTrue(multiSummary.contains("24.5%") || multiSummary.contains("Operating Margin"))
+        assertTrue(multiSummary.contains("Priya Nair") || multiSummary.contains("safety audit"))
+        assertTrue(multiSummary.contains("(p. 2)"))
+        assertTrue(multiSummary.contains("(p. 3)"))
+        assertTrue(multiSummary.contains("PAGE-BY-PAGE OUTLINE"))
+
+        // Verify compact cloud prompt strictly stays bounded for ultra-fast gemini-3.5-flash-lite calls
+        val fakeFile = PhoneFileItem(
+            id = "pdf_test_multipage_42",
+            name = "Quarterly_Operations_2026.pdf",
+            fullPath = "/storage/emulated/0/Download/Quarterly_Operations_2026.pdf",
+            extension = "pdf",
+            mimeType = "application/pdf",
+            sizeBytes = 512_000L,
+            createdAtMillis = 1_710_000_000_000L,
+            modifiedAtMillis = 1_710_000_000_000L,
+            category = FileCategory.PDF,
+            storageLocation = StorageLocation.INTERNAL,
+            volumeLabel = "Internal Shared",
+            contentUri = uri.toString(),
+            isSampleFile = true
+        )
+        val compactPrompt = com.example.ui.components.buildCompactCloudPdfPrompt(
+            file = fakeFile,
+            extraction = extractionResult,
+            rankedPassages = emptyList(),
+            question = "Summarize this PDF",
+            maxContextChars = 1_500
+        )
+        assertTrue(compactPrompt.length < 2_600)
+        assertTrue(compactPrompt.contains("--- Page 1 ---"))
+        assertTrue(compactPrompt.contains("--- Page 2 ---"))
+        assertTrue(compactPrompt.contains("--- Page 3 ---"))
+        assertTrue(compactPrompt.contains("never spam [Page 1]"))
     }
 }
 
